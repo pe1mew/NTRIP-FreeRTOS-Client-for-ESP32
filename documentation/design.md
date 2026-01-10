@@ -1057,6 +1057,320 @@ typedef struct {
 
 ---
 
+## LED Indicator Task
+
+**Purpose**: Control visual status indicators for system components including WiFi connectivity, NTRIP connection, MQTT status, GPS fix quality, and general system status via RGB LED.
+
+**Runtime Control**: 
+- **Always enabled** - provides critical visual feedback for system status
+- **No configuration needed** - operates autonomously based on system state
+- **Automatic updates** - monitors status changes from all subsystems in real-time
+
+### Configuration:
+- **Update Rate**: 100 ms (10 Hz for smooth blinking)
+- **Blink Rate**: 500 ms period (1 Hz) for activity indicators
+- **LED Pins**: Defined in hardware_config.h
+  - WiFi LED: GPIO 46
+  - NTRIP LED: GPIO 9
+  - MQTT LED: GPIO 10
+  - FIX_RTK_LED: GPIO 12
+  - FIX_RTKFLOAT_LED: GPIO 11
+  - Neopixel RGB LED: GPIO 38 (Lolin S3 built-in)
+
+### Responsibilities:
+
+**WiFi Status Indication**:
+- **ON (solid)**: STA mode connected to WiFi router
+- **OFF**: STA mode disconnected or attempting connection
+- Monitor: WiFi event notifications from WiFi Manager
+
+**NTRIP Status Indication**:
+- **OFF**: NTRIP client disabled or disconnected
+- **ON (solid)**: Connected to NTRIP caster, no recent data
+- **BLINK**: Connected and actively receiving RTCM packets
+- Blink trigger: RTCM data received within last 2 seconds
+- Monitor: NTRIP client connection status and RTCM packet timestamps
+
+**MQTT Status Indication**:
+- **OFF**: MQTT client disabled or disconnected
+- **ON (solid)**: Connected to broker, idle
+- **BLINK**: Message sent or received within last 2 seconds
+- Blink trigger: MQTT publish/subscribe activity
+- Monitor: MQTT client connection status and message events
+
+**GPS Fix Quality Indication (FIX_RTK_LED)**:
+- **OFF**: No GPS fix (quality 0) or invalid data
+- **ON (solid)**: Valid GPS coordinate received (quality >= 1)
+- Indicates: Basic GPS fix, DGPS, or any RTK mode
+- Monitor: GGA sentence fix quality field
+
+**RTK Fix Status Indication (FIX_RTKFLOAT_LED)**:
+- **OFF**: No RTK solution (quality < 2)
+- **BLINK**: RTK Float fix (quality 2) - partial RTK convergence
+- **ON (solid)**: RTK Fixed solution (quality 4 or 5) - full RTK accuracy
+- Blink rate: 1 Hz (500ms on/off) for RTK Float
+- Monitor: GGA sentence fix quality field
+
+**Neopixel RGB LED (General Status)**:
+- **OFF**: System initializing or error state
+- **GREEN**: System operating normally, all configured services running
+- **YELLOW**: Partial operation (e.g., WiFi connected but NTRIP/MQTT disabled)
+- **RED**: Critical error or configuration issue
+- **BLUE (pulsing)**: Firmware update in progress (future feature)
+- Monitor: Overall system health from all subsystems
+
+### Data Structures:
+
+```c
+typedef struct {
+    bool wifi_sta_connected;
+    bool ntrip_connected;
+    bool ntrip_data_activity;      // RTCM received in last 2 seconds
+    bool mqtt_connected;
+    bool mqtt_activity;             // Message sent/received in last 2 seconds
+    uint8_t gps_fix_quality;        // 0=no fix, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK float
+    bool gps_data_valid;            // Valid GGA data available
+    time_t last_ntrip_data_time;
+    time_t last_mqtt_activity_time;
+} led_status_t;
+
+typedef enum {
+    LED_OFF = 0,
+    LED_ON = 1,
+    LED_BLINK = 2
+} led_state_t;
+
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} rgb_color_t;
+
+// Predefined colors for Neopixel status
+#define RGB_OFF         {0, 0, 0}
+#define RGB_GREEN       {0, 255, 0}
+#define RGB_YELLOW      {255, 255, 0}
+#define RGB_RED         {255, 0, 0}
+#define RGB_BLUE        {0, 0, 255}
+```
+
+### LED State Logic:
+
+**WiFi LED Logic**:
+```c
+wifi_led_state = wifi_sta_connected ? LED_ON : LED_OFF;
+```
+
+**NTRIP LED Logic**:
+```c
+if (!ntrip_connected) {
+    ntrip_led_state = LED_OFF;
+} else if (time_since_last_rtcm < 2000ms) {
+    ntrip_led_state = LED_BLINK;
+} else {
+    ntrip_led_state = LED_ON;
+}
+```
+
+**MQTT LED Logic**:
+```c
+if (!mqtt_connected) {
+    mqtt_led_state = LED_OFF;
+} else if (time_since_last_mqtt_activity < 2000ms) {
+    mqtt_led_state = LED_BLINK;
+} else {
+    mqtt_led_state = LED_ON;
+}
+```
+
+**FIX_RTK_LED Logic**:
+```c
+fix_rtk_led_state = (gps_data_valid && gps_fix_quality >= 1) ? LED_ON : LED_OFF;
+```
+
+**FIX_RTKFLOAT_LED Logic**:
+```c
+if (gps_fix_quality == 2) {
+    fix_rtkfloat_led_state = LED_BLINK;  // RTK Float
+} else if (gps_fix_quality >= 4) {
+    fix_rtkfloat_led_state = LED_ON;     // RTK Fixed
+} else {
+    fix_rtkfloat_led_state = LED_OFF;    // No RTK
+}
+```
+
+**Neopixel RGB LED Logic**:
+```c
+if (system_error) {
+    rgb_color = RGB_RED;
+} else if (!wifi_sta_connected) {
+    rgb_color = RGB_YELLOW;  // AP only mode
+} else if (all_enabled_services_running) {
+    rgb_color = RGB_GREEN;   // Full operation
+} else {
+    rgb_color = RGB_YELLOW;  // Partial operation
+}
+```
+
+### Status Monitoring Sources:
+
+**Data Collection**:
+1. Query WiFi Manager for STA connection status
+2. Query NTRIP Client Task for connection status and last RTCM timestamp
+3. Query MQTT Client for connection status and activity events
+4. Read GNSS data (with mutex) for fix quality from GGA sentence
+5. Monitor configuration to determine which services should be enabled
+
+**Event-Driven Updates** (optional optimization):
+- Subscribe to WiFi connection/disconnection events
+- Subscribe to NTRIP connection events
+- Subscribe to MQTT connection/message events
+- Subscribe to GNSS data update notifications
+
+### Task Loop Structure:
+
+```c
+void vLEDIndicatorTask(void *pvParameters) {
+    led_status_t status = {0};
+    uint32_t blink_counter = 0;
+    bool blink_state = false;
+    
+    ESP_LOGI(TAG, "LED Indicator Task started");
+    
+    // Initialize GPIO pins for LEDs
+    initLEDGPIOs();
+    
+    // Initialize Neopixel (if using library like esp_led_strip)
+    initNeopixelLED();
+    
+    while (1) {
+        // Update blink counter (toggles every 500ms for 1 Hz blink)
+        blink_counter++;
+        if (blink_counter >= 5) {  // 5 * 100ms = 500ms
+            blink_state = !blink_state;
+            blink_counter = 0;
+        }
+        
+        // Collect status from all subsystems
+        status.wifi_sta_connected = wifi_manager_is_sta_connected();
+        status.ntrip_connected = ntrip_client_is_connected();
+        status.mqtt_connected = mqtt_is_connected();
+        
+        // Get GNSS data for fix quality
+        gnss_data_t gnss_data;
+        gnss_get_data(&gnss_data);
+        status.gps_data_valid = gnss_data.valid;
+        status.gps_fix_quality = parseGGAFixQuality(gnss_data.gga);
+        
+        // Check activity timestamps
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        time_t now = tv.tv_sec;
+        
+        status.ntrip_data_activity = (now - status.last_ntrip_data_time) < 2;
+        status.mqtt_activity = (now - status.last_mqtt_activity_time) < 2;
+        
+        // Update discrete LEDs
+        updateLED(WIFI_LED, status.wifi_sta_connected);
+        updateLED(NTRIP_LED, calculateNTRIPLEDState(&status, blink_state));
+        updateLED(MQTT_LED, calculateMQTTLEDState(&status, blink_state));
+        updateLED(FIX_RTK_LED, status.gps_data_valid && status.gps_fix_quality >= 1);
+        updateLED(FIX_RTKFLOAT_LED, calculateRTKFloatLEDState(&status, blink_state));
+        
+        // Update Neopixel RGB LED
+        rgb_color_t rgb = calculateSystemStatusColor(&status);
+        updateNeopixel(rgb.r, rgb.g, rgb.b);
+        
+        // Delay 100ms for 10 Hz update rate
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+```
+
+### GPIO Configuration:
+
+```c
+void initLEDGPIOs(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << WIFI_LED) | 
+                       (1ULL << NTRIP_LED) | 
+                       (1ULL << MQTT_LED) | 
+                       (1ULL << FIX_RTK_LED) | 
+                       (1ULL << FIX_RTKFLOAT_LED),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    
+    // Initialize all LEDs to OFF
+    gpio_set_level(WIFI_LED, 0);
+    gpio_set_level(NTRIP_LED, 0);
+    gpio_set_level(MQTT_LED, 0);
+    gpio_set_level(FIX_RTK_LED, 0);
+    gpio_set_level(FIX_RTKFLOAT_LED, 0);
+}
+```
+
+### Neopixel Integration:
+
+Use ESP-IDF component `led_strip` for Neopixel control:
+```c
+#include "led_strip.h"
+
+static led_strip_handle_t led_strip;
+
+void initNeopixelLED(void) {
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = STATUS_LED_PIN,  // GPIO 38
+        .max_leds = 1,
+        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
+        .led_model = LED_MODEL_WS2812,
+        .flags.invert_out = false,
+    };
+    
+    led_strip_rmt_config_t rmt_config = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000, // 10 MHz
+        .flags.with_dma = false,
+    };
+    
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+}
+
+void updateNeopixel(uint8_t r, uint8_t g, uint8_t b) {
+    led_strip_set_pixel(led_strip, 0, r, g, b);
+    led_strip_refresh(led_strip);
+}
+```
+
+### Implementation Notes:
+- Task priority: 2 (lower than critical communication tasks)
+- Stack size: 3072 bytes
+- Use `gpio_set_level()` for discrete LEDs (fast, no library needed)
+- Use ESP-IDF `led_strip` component for Neopixel RGB LED
+- Parse GGA fix quality field: characters after 6th comma in GGA sentence
+- Consider adding brightness control for Neopixel via configuration
+- Activity timestamps updated by respective tasks (NTRIP, MQTT) via shared variables or events
+- Optional: Add LED test mode on startup (cycle through all LEDs)
+
+### GGA Fix Quality Values:
+```c
+// From NMEA GGA sentence field 6
+#define GPS_FIX_NONE       0  // No fix
+#define GPS_FIX_GPS        1  // GPS fix (SPS)
+#define GPS_FIX_DGPS       2  // DGPS fix
+#define GPS_FIX_PPS        3  // PPS fix
+#define GPS_FIX_RTK_FIXED  4  // RTK Fixed
+#define GPS_FIX_RTK_FLOAT  5  // RTK Float
+#define GPS_FIX_ESTIMATED  6  // Estimated (dead reckoning)
+#define GPS_FIX_MANUAL     7  // Manual input mode
+#define GPS_FIX_SIMULATION 8  // Simulation mode
+```
+
+---
+
 ### Communication:
  - FreeRTOS queues for inter-task data passing
  - Event groups for status synchronization

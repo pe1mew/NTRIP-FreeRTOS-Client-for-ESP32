@@ -2,51 +2,95 @@
 #include <freertos/task.h>
 #include <esp_log.h>
 #include <esp_system.h>
-#include "helloWorld/rgbLedTask.h"
-#include "helloWorld/buttonBootTask.h"
+#include <nvs_flash.h>
+#include "configurationManagerTask.h"
+#include "wifiManager.h"
+#include "httpServer.h"
+#include "ntripClientTask.h"
+#include "gnssReceiverTask.h"
+#include "ledIndicatorTask.h"
 
 static const char *TAG = "MAIN";
 
 extern "C" void app_main(void) {
+    esp_err_t ret;
+    
     // Initialize logging
-    ESP_LOGI(TAG, "\n\n=================================");
-    ESP_LOGI(TAG, "Lolin S3 FreeRTOS RGB LED Demo");
-    ESP_LOGI(TAG, "=================================\n");
-
-    // Initialize the RGB LED hardware
-    esp_err_t ret = initRGBLed();
+    ESP_LOGI(TAG, "\n\n===========================================");
+    ESP_LOGI(TAG, "ESP32-S3 NTRIP/GPS/MQTT System Starting...");
+    ESP_LOGI(TAG, "===========================================\n");
+    
+    // ========================================
+    // Step 1: Initialize NVS Flash
+    // ========================================
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition needs to be erased");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "✓ NVS Flash initialized");
+    
+    // ========================================
+    // Step 2: Initialize Configuration Manager
+    // ========================================
+    ret = config_manager_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize RGB LED: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to initialize Configuration Manager: %s", esp_err_to_name(ret));
         return;
     }
-
-    // Initialize the button hardware
-    ret = initButton();
+    ESP_LOGI(TAG, "✓ Configuration Manager initialized");
+    
+    // ========================================
+    // Step 3: Initialize WiFi Manager (AP+STA)
+    // ========================================
+    ret = wifi_manager_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize button: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to initialize WiFi Manager: %s", esp_err_to_name(ret));
         return;
     }
-
-    // Create FreeRTOS task for blinking RGB LED
-    xTaskCreate(
-        vBlinkRGBTask,           // Task function
-        "RGB_Blink",             // Task name
-        2048,                    // Stack size (bytes)
-        NULL,                    // Task parameters
-        1,                       // Task priority
-        NULL                     // Task handle
-    );
-
-    // Create FreeRTOS task for button monitoring
-    xTaskCreate(
-        vButtonTask,             // Task function
-        "Button_Monitor",        // Task name
-        2048,                    // Stack size (bytes)
-        NULL,                    // Task parameters
-        2,                       // Task priority (higher than LED task)
-        NULL                     // Task handle
-    );
-
-    ESP_LOGI(TAG, "FreeRTOS tasks created successfully");
-    ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "✓ WiFi Manager initialized (AP mode: 192.168.4.1)");
+    
+    // ========================================
+    // Step 4: Initialize HTTP Server
+    // ========================================
+    ret = http_server_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP Server: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "✓ HTTP Server initialized (port 80)");
+    
+    // ========================================
+    // Step 5: Initialize NTRIP Client Task
+    // ========================================
+    ret = ntrip_client_task_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize NTRIP Client Task: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "✓ NTRIP Client Task initialized");
+    
+    // ========================================
+    // Step 6: Initialize GNSS Receiver Task
+    // ========================================
+    gnss_receiver_task_init();
+    ESP_LOGI(TAG, "✓ GNSS Receiver Task initialized");
+    
+    // ========================================
+    // Step 7: Initialize LED Indicator Task
+    // ========================================
+    led_indicator_task_init();
+    ESP_LOGI(TAG, "✓ LED Indicator Task initialized");
+    
+    // ========================================
+    // System Ready
+    // ========================================
+    ESP_LOGI(TAG, "\n===========================================");
+    ESP_LOGI(TAG, "System Initialization Complete!");
+    ESP_LOGI(TAG, "===========================================");
+    ESP_LOGI(TAG, "Configuration Interface: http://192.168.4.1");
+    ESP_LOGI(TAG, "Check WiFi Manager logs above for AP SSID");
+    ESP_LOGI(TAG, "Free heap: %lu bytes\n", esp_get_free_heap_size());
 }
