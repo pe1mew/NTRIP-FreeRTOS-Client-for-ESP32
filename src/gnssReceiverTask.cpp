@@ -248,7 +248,7 @@ static void gnss_receiver_task(void *pvParameters) {
                     
                     // Send to NTRIP Client (non-blocking)
                     if (xQueueSend(gga_queue, &gga_data, 0) == pdTRUE) {
-                        ESP_LOGD(TAG, "Sent GGA to NTRIP Client");
+                        ESP_LOGI(TAG, "Sent GGA to NTRIP queue: %s", gga_data.sentence);
                         last_gga_time = current_time;
                     } else {
                         ESP_LOGW(TAG, "GGA queue full, overwriting");
@@ -257,6 +257,9 @@ static void gnss_receiver_task(void *pvParameters) {
                         xQueueSend(gga_queue, &gga_data, 0);
                         last_gga_time = current_time;
                     }
+                } else {
+                    ESP_LOGD(TAG, "GGA send interval elapsed but no valid GNSS data (valid=%d, gga_len=%d)", 
+                             gnss_data.valid, strlen(gnss_data.gga));
                 }
                 xSemaphoreGive(gnss_data_mutex);
             }

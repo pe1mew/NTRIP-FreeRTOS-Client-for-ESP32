@@ -301,7 +301,9 @@ int NTRIPClient::readData(uint8_t* data, size_t size) {
     int read_len = esp_http_client_read(client, (char*)data, size);
     if (read_len < 0) {
         ESP_LOGE(TAG, "Error reading data: %d", read_len);
-        return 0;
+        // Mark as disconnected on read error
+        connected_flag = false;
+        return -1;  // Return error instead of 0
     }
     
     return read_len;

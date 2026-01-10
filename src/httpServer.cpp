@@ -295,19 +295,29 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
     }
     
     app_config_t config;
+    app_config_t old_config;
     config_get_all(&config);  // Get current config first
+    memcpy(&old_config, &config, sizeof(app_config_t));  // Keep a copy for comparison
+    
+    bool wifi_changed = false;
+    bool ntrip_changed = false;
+    bool mqtt_changed = false;
     
     // Parse WiFi config
     cJSON *wifi = cJSON_GetObjectItem(root, "wifi");
     if (wifi) {
         cJSON *ssid = cJSON_GetObjectItem(wifi, "ssid");
         cJSON *password = cJSON_GetObjectItem(wifi, "password");
-        if (ssid && cJSON_IsString(ssid)) {
+        if (ssid && cJSON_IsString(ssid) && strcmp(config.wifi.ssid, ssid->valuestring) != 0) {
             strncpy(config.wifi.ssid, ssid->valuestring, sizeof(config.wifi.ssid) - 1);
+            wifi_changed = true;
         }
-        // Only update password if it's not empty
+        // Only update password if it's not empty AND different
         if (password && cJSON_IsString(password) && strlen(password->valuestring) > 0) {
-            strncpy(config.wifi.password, password->valuestring, sizeof(config.wifi.password) - 1);
+            if (strcmp(config.wifi.password, password->valuestring) != 0) {
+                strncpy(config.wifi.password, password->valuestring, sizeof(config.wifi.password) - 1);
+                wifi_changed = true;
+            }
         }
     }
     
@@ -322,16 +332,17 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
         cJSON *password = cJSON_GetObjectItem(ntrip, "password");
         cJSON *gga_interval = cJSON_GetObjectItem(ntrip, "gga_interval_sec");
         
-        if (enabled && cJSON_IsBool(enabled)) config.ntrip.enabled = cJSON_IsTrue(enabled);
-        if (host && cJSON_IsString(host)) strncpy(config.ntrip.host, host->valuestring, sizeof(config.ntrip.host) - 1);
-        if (port && cJSON_IsNumber(port)) config.ntrip.port = port->valueint;
-        if (mountpoint && cJSON_IsString(mountpoint)) strncpy(config.ntrip.mountpoint, mountpoint->valuestring, sizeof(config.ntrip.mountpoint) - 1);
-        if (user && cJSON_IsString(user)) strncpy(config.ntrip.user, user->valuestring, sizeof(config.ntrip.user) - 1);
+        if (enabled && cJSON_IsBool(enabled)) { config.ntrip.enabled = cJSON_IsTrue(enabled); ntrip_changed = true; }
+        if (host && cJSON_IsString(host)) { strncpy(config.ntrip.host, host->valuestring, sizeof(config.ntrip.host) - 1); ntrip_changed = true; }
+        if (port && cJSON_IsNumber(port)) { config.ntrip.port = port->valueint; ntrip_changed = true; }
+        if (mountpoint && cJSON_IsString(mountpoint)) { strncpy(config.ntrip.mountpoint, mountpoint->valuestring, sizeof(config.ntrip.mountpoint) - 1); ntrip_changed = true; }
+        if (user && cJSON_IsString(user)) { strncpy(config.ntrip.user, user->valuestring, sizeof(config.ntrip.user) - 1); ntrip_changed = true; }
         // Only update password if it's not empty
         if (password && cJSON_IsString(password) && strlen(password->valuestring) > 0) {
             strncpy(config.ntrip.password, password->valuestring, sizeof(config.ntrip.password) - 1);
+            ntrip_changed = true;
         }
-        if (gga_interval && cJSON_IsNumber(gga_interval)) config.ntrip.gga_interval_sec = gga_interval->valueint;
+        if (gga_interval && cJSON_IsNumber(gga_interval)) { config.ntrip.gga_interval_sec = gga_interval->valueint; ntrip_changed = true; }
     }
     
     // Parse MQTT config
@@ -344,28 +355,49 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
         cJSON *user = cJSON_GetObjectItem(mqtt, "user");
         cJSON *password = cJSON_GetObjectItem(mqtt, "password");
         
-        if (enabled && cJSON_IsBool(enabled)) config.mqtt.enabled = cJSON_IsTrue(enabled);
-        if (broker && cJSON_IsString(broker)) strncpy(config.mqtt.broker, broker->valuestring, sizeof(config.mqtt.broker) - 1);
-        if (port && cJSON_IsNumber(port)) config.mqtt.port = port->valueint;
-        if (topic && cJSON_IsString(topic)) strncpy(config.mqtt.topic, topic->valuestring, sizeof(config.mqtt.topic) - 1);
-        if (user && cJSON_IsString(user)) strncpy(config.mqtt.user, user->valuestring, sizeof(config.mqtt.user) - 1);
+        if (enabled && cJSON_IsBool(enabled)) { config.mqtt.enabled = cJSON_IsTrue(enabled); mqtt_changed = true; }
+        if (broker && cJSON_IsString(broker)) { strncpy(config.mqtt.broker, broker->valuestring, sizeof(config.mqtt.broker) - 1); mqtt_changed = true; }
+        if (port && cJSON_IsNumber(port)) { config.mqtt.port = port->valueint; mqtt_changed = true; }
+        if (topic && cJSON_IsString(topic)) { strncpy(config.mqtt.topic, topic->valuestring, sizeof(config.mqtt.topic) - 1); mqtt_changed = true; }
+        if (user && cJSON_IsString(user)) { strncpy(config.mqtt.user, user->valuestring, sizeof(config.mqtt.user) - 1); mqtt_changed = true; }
         // Only update password if it's not empty
         if (password && cJSON_IsString(password) && strlen(password->valuestring) > 0) {
             strncpy(config.mqtt.password, password->valuestring, sizeof(config.mqtt.password) - 1);
+            mqtt_changed = true;
         }
     }
     
     cJSON_Delete(root);
     
-    // Save configuration
-    if (config_set_all(&config) != ESP_OK) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Failed to save configuration\"}");
-        return ESP_FAIL;
+    // Save only what changed to avoid unnecessary reconnections
+    esp_err_t err = ESP_OK;
+    if (wifi_changed) {
+        err = config_set_wifi(&config.wifi);
+        if (err != ESP_OK) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Failed to save WiFi configuration\"}");
+            return ESP_FAIL;
+        }
+    }
+    if (ntrip_changed) {
+        err = config_set_ntrip(&config.ntrip);
+        if (err != ESP_OK) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Failed to save NTRIP configuration\"}");
+            return ESP_FAIL;
+        }
+    }
+    if (mqtt_changed) {
+        err = config_set_mqtt(&config.mqtt);
+        if (err != ESP_OK) {
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Failed to save MQTT configuration\"}");
+            return ESP_FAIL;
+        }
     }
     
-    // Apply WiFi changes if needed
-    if (wifi && strlen(config.wifi.ssid) > 0) {
+    // Apply WiFi changes ONLY if WiFi was actually changed
+    if (wifi_changed && strlen(config.wifi.ssid) > 0) {
         wifi_manager_connect_sta(config.wifi.ssid, config.wifi.password);
     }
     

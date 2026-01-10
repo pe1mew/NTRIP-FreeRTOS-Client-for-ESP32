@@ -14,6 +14,7 @@
 #include "NTRIPclient/NTRIPClient.h"
 #include "configurationManagerTask.h"
 #include "ledIndicatorTask.h"
+#include "wifiManager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <freertos/event_groups.h>
@@ -94,6 +95,13 @@ static void ntrip_client_task(void* pvParameters) {
         
         // Handle connection state
         if (ntrip_config.enabled && !ntrip_connected) {
+            // Only attempt connection if WiFi is connected
+            if (!wifi_manager_is_sta_connected()) {
+                // WiFi not connected, skip connection attempt
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            
             int64_t now = esp_timer_get_time();
             int64_t time_since_last_attempt = (now - last_connect_attempt) / 1000000;
             
@@ -128,8 +136,8 @@ static void ntrip_client_task(void* pvParameters) {
                 
                 if (connect_success && client->isConnected()) {
                     ntrip_connected = true;
-                    last_gga_time = 0; // Reset GGA timer to send immediately
-                    ESP_LOGI(TAG, "Successfully connected to NTRIP caster");
+                    last_gga_time = -1; // Set to -1 to trigger immediate GGA send on first message
+                    ESP_LOGI(TAG, "Successfully connected to NTRIP caster, waiting for first GGA");
                 } else {
                     ESP_LOGW(TAG, "Failed to connect to NTRIP caster, will retry in %d seconds", 
                              ntrip_config.reconnect_delay_sec);
@@ -146,12 +154,27 @@ static void ntrip_client_task(void* pvParameters) {
         
         // Handle connected state operations
         if (ntrip_connected && client->isConnected()) {
+            // Check if WiFi is still connected before attempting to read
+            if (!wifi_manager_is_sta_connected()) {
+                ESP_LOGW(TAG, "WiFi disconnected, marking NTRIP as disconnected");
+                client->disconnect();
+                ntrip_connected = false;
+                reconnect_needed = true;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            
             // Check for incoming RTCM data
             if (client->available() > 0) {
                 rtcm_data_t rtcm_msg;
                 int bytes_read = client->readData(rtcm_msg.data, sizeof(rtcm_msg.data));
                 
-                if (bytes_read > 0) {
+                if (bytes_read < 0) {
+                    // Read error - connection lost
+                    ESP_LOGW(TAG, "Read error, marking connection as lost");
+                    ntrip_connected = false;
+                    reconnect_needed = true;
+                } else if (bytes_read > 0) {
                     rtcm_msg.length = bytes_read;
                     
                     // Notify LED task of RTCM data activity
@@ -180,9 +203,24 @@ static void ntrip_client_task(void* pvParameters) {
             // Check for GGA sentences to send
             gga_data_t gga_msg;
             if (xQueueReceive(gga_queue, &gga_msg, 0) == pdTRUE) {
-                client->sendGGA(gga_msg.sentence);
-                last_gga_time = esp_timer_get_time();
-                ESP_LOGD(TAG, "Sent GGA: %s", gga_msg.sentence);
+                // Send immediately if this is the first GGA (last_gga_time == -1)
+                // or if the interval has elapsed
+                int64_t now = esp_timer_get_time();
+                int64_t time_since_last_gga = (last_gga_time == -1) ? INT64_MAX : (now - last_gga_time) / 1000000;
+                
+                if (last_gga_time == -1 || time_since_last_gga >= ntrip_config.gga_interval_sec) {
+                    client->sendGGA(gga_msg.sentence);
+                    last_gga_time = now;
+                    if (time_since_last_gga == INT64_MAX) {
+                        ESP_LOGI(TAG, "Sent first GGA to NTRIP server, starting %d sec interval: %s", 
+                                 ntrip_config.gga_interval_sec, gga_msg.sentence);
+                    } else {
+                        ESP_LOGI(TAG, "Sent GGA to NTRIP server: %s", gga_msg.sentence);
+                    }
+                } else {
+                    ESP_LOGD(TAG, "GGA received but interval not elapsed yet (%lld/%d sec)", 
+                             time_since_last_gga, ntrip_config.gga_interval_sec);
+                }
             } else {
                 // Send GGA periodically even if not received from GNSS (keep connection alive)
                 int64_t now = esp_timer_get_time();
