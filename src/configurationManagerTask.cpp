@@ -25,7 +25,8 @@ static app_config_t app_config;
 static const app_config_t default_config = {
     .wifi = {
         .ssid = "YourWiFiSSID",
-        .password = "YourWiFiPassword"
+        .password = "YourWiFiPassword",
+        .ap_password = "config123"
     },
     .ntrip = {
         .host = "rtk2go.com",
@@ -75,6 +76,11 @@ static esp_err_t nvs_load_wifi(app_wifi_config_t* config) {
         ESP_LOGW(TAG, "Failed to read WiFi password from NVS");
     }
 
+    size = sizeof(config->ap_password);
+    err = nvs_get_str(handle, "ap_password", config->ap_password, &size);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read AP password from NVS");
+    }
     nvs_close(handle);
     return ESP_OK;
 }
@@ -106,6 +112,12 @@ static esp_err_t nvs_save_wifi(const app_wifi_config_t* config) {
         return err;
     }
 
+    err = nvs_set_str(handle, "ap_password", config->ap_password);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write AP password to NVS: %s", esp_err_to_name(err));
+        nvs_close(handle);
+        return err;
+    }
     err = nvs_commit(handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to commit WiFi config to NVS: %s", esp_err_to_name(err));

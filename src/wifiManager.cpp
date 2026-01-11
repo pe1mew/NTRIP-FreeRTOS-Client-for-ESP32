@@ -1,4 +1,13 @@
 #include "wifiManager.h"
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+void wifi_manager_get_ap_ssid(char* out_ssid, unsigned int len) {
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_AP, mac);
+    snprintf(out_ssid, len, "%s-%02X%02X", WIFI_AP_SSID, mac[4], mac[5]);
+}
+#include "wifiManager.h"
 #include "configurationManagerTask.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -179,23 +188,24 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
  */
 static esp_err_t wifi_init_ap(void) {
     wifi_config_t wifi_config = {};
-    
+    app_wifi_config_t stored_config;
+    config_get_wifi(&stored_config);
     // Create SSID with MAC address - use base SSID first, will update after start
     strncpy((char*)wifi_config.ap.ssid, WIFI_AP_SSID, sizeof(wifi_config.ap.ssid));
-    strncpy((char*)wifi_config.ap.password, WIFI_AP_PASSWORD, sizeof(wifi_config.ap.password));
+    if (strlen(stored_config.ap_password) > 0) {
+        strncpy((char*)wifi_config.ap.password, stored_config.ap_password, sizeof(wifi_config.ap.password));
+    } else {
+        strncpy((char*)wifi_config.ap.password, WIFI_AP_PASSWORD, sizeof(wifi_config.ap.password));
+    }
     wifi_config.ap.ssid_len = 0; // Let ESP-IDF calculate from null-terminated string
     wifi_config.ap.channel = WIFI_AP_CHANNEL;
     wifi_config.ap.max_connection = WIFI_AP_MAX_CONN;
     wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    
-    if (strlen(WIFI_AP_PASSWORD) == 0) {
+    if (strlen((const char*)wifi_config.ap.password) == 0) {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
-    
     ESP_LOGD(TAG, "Configuring AP with base SSID: %s", WIFI_AP_SSID);
-    
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    
     return ESP_OK;
 }
 

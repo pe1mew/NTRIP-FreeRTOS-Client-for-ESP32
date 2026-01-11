@@ -1,3 +1,8 @@
+/**
+ * @brief Get the actual AP SSID (with MAC suffix)
+ * @param out_ssid Buffer to write SSID (min 32 bytes)
+ */
+void wifi_manager_get_ap_ssid(char* out_ssid, unsigned int len);
 #ifndef WIFI_MANAGER_H
 #define WIFI_MANAGER_H
 

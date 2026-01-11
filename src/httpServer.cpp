@@ -12,6 +12,7 @@
 static const char* TAG = "HTTPServer";
 
 static httpd_handle_t server = NULL;
+#include "gnssReceiverTask.h"
 
 // HTML content for main configuration page
 static const char* html_page = 
@@ -57,18 +58,33 @@ static const char* html_page =
 "    <div class='container'>\n"
 "        <h1>NTRIP-client Configuration</h1>\n"
 "        <div id='status'></div>\n"
-"        <div class='info'>\n"
-"            <strong>System Status:</strong>\n"
-"            <p>WiFi AP: 192.168.4.1 | STA: <span id='sta_status'>Checking...</span></p>\n"
+"        <h2>GNSS status</h2>\n"
+"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>GNSS status:</span>\n"
+"            <span id='gnss_status_indicator' class='status-indicator disconnected' title='Valid NMEA'></span>\n"
+"            <span style='color:#555; font-size:15px; margin-left:18px;'>Satellites: <span id='gnss_sat_count'>0</span></span>\n"
 "        </div>\n"
 "        <h2>WiFi Configuration</h2>\n"
+"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>WiFi status:</span>\n"
+"            <span id='wifi_status_indicator' class='status-indicator disconnected' title='WiFi status'></span>\n"
+"            <span style='color:#555; font-size:15px; margin-left:18px;'>STA IP: <span id='sta_ip_display'>Checking...</span></span>\n"
+"        </div>\n"
 "        <div class='form-group'>\n"
-"            <label>SSID:</label>\n"
+"            <label>STA SSID:</label>\n"
 "            <input type='text' id='wifi_ssid' maxlength='31'>\n"
 "        </div>\n"
 "        <div class='form-group'>\n"
-"            <label>Password:</label>\n"
+"            <label>STA Password:</label>\n"
 "            <input type='password' id='wifi_password' maxlength='63' placeholder='Leave blank to keep current password'>\n"
+"        </div>\n"
+"        <div class='form-group'>\n"
+"            <label>AP SSID:</label>\n"
+"            <input type='text' id='ap_ssid' maxlength='31' readonly style='background:#f5f5f5;'>\n"
+"        </div>\n"
+"        <div class='form-group'>\n"
+"            <label>AP Password:</label>\n"
+"            <input type='password' id='ap_password' maxlength='63' placeholder='Leave blank to keep current password'>\n"
 "        </div>\n"
 "        <h2 style='margin-bottom: 8px;'>NTRIP Configuration</h2>\n"
 "        <div class='switch-container'>\n"
@@ -160,6 +176,7 @@ static const char* html_page =
 "        function loadConfig() {\n"
 "            fetch('/api/config').then(r => r.json()).then(data => {\n"
 "                document.getElementById('wifi_ssid').value = data.wifi.ssid;\n"
+"                document.getElementById('ap_ssid').value = data.wifi.ap_ssid || 'NTRIPClient';\n"
 "                // Don't populate password fields - leave empty with placeholder\n"
 "                document.getElementById('ntrip_enabled').checked = data.ntrip.enabled;\n"
 "                document.getElementById('ntrip_host').value = data.ntrip.host;\n"
@@ -179,7 +196,7 @@ static const char* html_page =
 "        }\n"
 "        function saveConfig() {\n"
 "            const config = {\n"
-"                wifi: { ssid: document.getElementById('wifi_ssid').value, password: document.getElementById('wifi_password').value },\n"
+"                wifi: { ssid: document.getElementById('wifi_ssid').value, password: document.getElementById('wifi_password').value, ap_password: document.getElementById('ap_password').value },\n"
 "                ntrip: { enabled: document.getElementById('ntrip_enabled').checked, host: document.getElementById('ntrip_host').value,\n"
 "                         port: parseInt(document.getElementById('ntrip_port').value), mountpoint: document.getElementById('ntrip_mountpoint').value,\n"
 "                         user: document.getElementById('ntrip_user').value, password: document.getElementById('ntrip_password').value,\n"
@@ -228,7 +245,28 @@ static const char* html_page =
 "        }\n"
 "        function updateStatus() {\n"
 "            fetch('/api/status').then(r => r.json()).then(data => {\n"
-"                document.getElementById('sta_status').textContent = data.wifi.sta_connected ? data.wifi.sta_ip : 'Not connected';\n"
+"                // GNSS indicator\n"
+"                var gnss = data.gnss_ok !== undefined ? data.gnss_ok : false;\n"
+"                var gnssInd = document.getElementById('gnss_status_indicator');\n"
+"                if (gnss) {\n"
+"                    gnssInd.classList.add('connected');\n"
+"                    gnssInd.classList.remove('disconnected');\n"
+"                } else {\n"
+"                    gnssInd.classList.remove('connected');\n"
+"                    gnssInd.classList.add('disconnected');\n"
+"                }\n"
+"                document.getElementById('gnss_sat_count').textContent = data.gnss_satellites !== undefined ? data.gnss_satellites : '0';\n"
+"                // WiFi indicator\n"
+"                var wifi = data.wifi.sta_connected !== undefined ? data.wifi.sta_connected : false;\n"
+"                var wifiInd = document.getElementById('wifi_status_indicator');\n"
+"                if (wifi) {\n"
+"                    wifiInd.classList.add('connected');\n"
+"                    wifiInd.classList.remove('disconnected');\n"
+"                } else {\n"
+"                    wifiInd.classList.remove('connected');\n"
+"                    wifiInd.classList.add('disconnected');\n"
+"                }\n"
+"                document.getElementById('sta_ip_display').textContent = data.wifi.sta_ip || 'Not connected';\n"
 "                // NTRIP indicator\n"
 "                var ntrip = data.ntrip_connected !== undefined ? data.ntrip_connected : false;\n"
 "                var ntripInd = document.getElementById('ntrip_status_indicator');\n"
@@ -272,22 +310,22 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
  */
 static esp_err_t api_config_get_handler(httpd_req_t *req) {
     app_config_t config;
-    
     if (config_get_all(&config) != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Failed to read configuration\"}");
         return ESP_FAIL;
     }
-    
     // Create JSON response (mask passwords)
     cJSON *root = cJSON_CreateObject();
-    
     // WiFi config
     cJSON *wifi = cJSON_CreateObject();
     cJSON_AddStringToObject(wifi, "ssid", config.wifi.ssid);
     cJSON_AddStringToObject(wifi, "password", "********");
+    char ap_ssid[32];
+    wifi_manager_get_ap_ssid(ap_ssid, sizeof(ap_ssid));
+    cJSON_AddStringToObject(wifi, "ap_ssid", ap_ssid);
+    cJSON_AddStringToObject(wifi, "ap_password", "********");
     cJSON_AddItemToObject(root, "wifi", wifi);
-    
     // NTRIP config
     cJSON *ntrip = cJSON_CreateObject();
     cJSON_AddStringToObject(ntrip, "host", config.ntrip.host);
@@ -367,6 +405,7 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
     if (wifi) {
         cJSON *ssid = cJSON_GetObjectItem(wifi, "ssid");
         cJSON *password = cJSON_GetObjectItem(wifi, "password");
+        cJSON *ap_password = cJSON_GetObjectItem(wifi, "ap_password");
         if (ssid && cJSON_IsString(ssid) && strcmp(config.wifi.ssid, ssid->valuestring) != 0) {
             strncpy(config.wifi.ssid, ssid->valuestring, sizeof(config.wifi.ssid) - 1);
             wifi_changed = true;
@@ -377,6 +416,11 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
                 strncpy(config.wifi.password, password->valuestring, sizeof(config.wifi.password) - 1);
                 wifi_changed = true;
             }
+        }
+        // Only update AP password if it's not empty
+        if (ap_password && cJSON_IsString(ap_password) && strlen(ap_password->valuestring) > 0) {
+            strncpy(config.wifi.ap_password, ap_password->valuestring, sizeof(config.wifi.ap_password) - 1);
+            wifi_changed = true;
         }
     }
     
@@ -500,6 +544,15 @@ static esp_err_t api_status_get_handler(httpd_req_t *req) {
     cJSON_AddNumberToObject(system, "uptime_sec", esp_timer_get_time() / 1000000);
     cJSON_AddNumberToObject(system, "free_heap", esp_get_free_heap_size());
     cJSON_AddItemToObject(root, "system", system);
+
+    // GNSS status: expose nmea received (valid) and satellite count
+    extern void gnss_get_data(gnss_data_t *data);
+    extern bool gnss_has_valid_fix(void);
+    gnss_data_t gnss;
+    gnss_get_data(&gnss);
+    bool gnss_ok = gnss_has_valid_fix();
+    cJSON_AddBoolToObject(root, "gnss_ok", gnss_ok);
+    cJSON_AddNumberToObject(root, "gnss_satellites", gnss.satellites);
 
     char *json_string = cJSON_Print(root);
     httpd_resp_set_type(req, "application/json");
