@@ -38,7 +38,10 @@ typedef struct {
     char topic[64];
     char user[32];
     char password[64];
-    bool enabled;  // Default: true
+    uint16_t gnss_interval_sec;    // Default: 10
+    uint16_t status_interval_sec;  // Default: 120
+    uint16_t stats_interval_sec;   // Default: 60
+    bool enabled;                  // Default: true
 } mqtt_config_t;
 
 // Application configuration structure (combined)
@@ -84,6 +87,18 @@ esp_err_t config_get_ntrip(ntrip_config_t* config);
 esp_err_t config_get_mqtt(mqtt_config_t* config);
 
 /**
+ * @brief Get MQTT configuration (thread-safe) - Compatibility wrapper
+ * 
+ * Same as config_get_mqtt, provided for naming consistency with other modules
+ * 
+ * @param config Pointer to mqtt_config_t structure to fill
+ * @return ESP_OK on success, error code otherwise
+ */
+static inline esp_err_t config_manager_get_mqtt_config(mqtt_config_t* config) {
+    return config_get_mqtt(config);
+}
+
+/**
  * @brief Get complete application configuration (thread-safe)
  * 
  * @param config Pointer to app_config_t structure to fill
@@ -110,6 +125,7 @@ esp_err_t config_set_wifi(const app_wifi_config_t* config);
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t config_set_ntrip(const ntrip_config_t* config);
+esp_err_t config_set_ntrip_enabled_runtime(bool enabled);
 
 /**
  * @brief Set MQTT configuration (thread-safe)
@@ -120,6 +136,7 @@ esp_err_t config_set_ntrip(const ntrip_config_t* config);
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t config_set_mqtt(const mqtt_config_t* config);
+esp_err_t config_set_mqtt_enabled_runtime(bool enabled);
 
 /**
  * @brief Set complete application configuration (thread-safe)

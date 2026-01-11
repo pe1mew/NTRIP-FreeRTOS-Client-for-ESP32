@@ -15,6 +15,7 @@
 #include "configurationManagerTask.h"
 #include "ledIndicatorTask.h"
 #include "wifiManager.h"
+#include "statisticsTask.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <freertos/event_groups.h>
@@ -31,6 +32,8 @@ static TaskHandle_t ntrip_task_handle = NULL;
 
 // Connection state
 static bool ntrip_connected = false;
+static time_t ntrip_connection_start = 0;
+static uint32_t ntrip_uptime_accumulated = 0;
 
 // Queue configuration
 #define RTCM_QUEUE_LENGTH   10  // Can buffer 10 RTCM messages
@@ -55,6 +58,7 @@ static void ntrip_client_task(void* pvParameters) {
     int64_t last_gga_time = 0;
     int64_t last_connect_attempt = 0;
     bool reconnect_needed = false;
+    int64_t last_config_poll = 0; // microseconds
     
     ESP_LOGI(TAG, "NTRIP Client Task started");
     
@@ -66,10 +70,15 @@ static void ntrip_client_task(void* pvParameters) {
         return;
     }
     
+    // Get configuration event group handle once
+    EventGroupHandle_t config_events = config_get_event_group();
+
     while (1) {
-        // Check for configuration changes
-        EventBits_t bits = config_wait_for_event(CONFIG_NTRIP_CHANGED_BIT, 0);
+        // Poll for configuration changes and clear handled bits (matches MQTT behavior)
+        EventBits_t bits = xEventGroupGetBits(config_events);
         if (bits & CONFIG_NTRIP_CHANGED_BIT) {
+            // Clear the specific bit we are handling
+            xEventGroupClearBits(config_events, CONFIG_NTRIP_CHANGED_BIT);
             ESP_LOGI(TAG, "NTRIP configuration changed");
             
             // Get new configuration first
@@ -91,6 +100,53 @@ static void ntrip_client_task(void* pvParameters) {
             }
             
             reconnect_needed = ntrip_config.enabled;
+        } else if (bits & CONFIG_ALL_CHANGED_BIT) {
+            // Clear the global change bit as we will refresh based on it
+            xEventGroupClearBits(config_events, CONFIG_ALL_CHANGED_BIT);
+            // Global config changed; refresh NTRIP config and apply changes similarly
+            ESP_LOGI(TAG, "Global configuration changed; refreshing NTRIP settings");
+            if (config_get_ntrip(&ntrip_config) != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to get updated NTRIP configuration");
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                continue;
+            }
+            if (ntrip_connected) {
+                if (ntrip_config.enabled) {
+                    ESP_LOGI(TAG, "Disconnecting to apply new NTRIP configuration (global change)");
+                } else {
+                    ESP_LOGI(TAG, "NTRIP disabled (global change), disconnecting");
+                }
+                client->disconnect();
+                ntrip_connected = false;
+            }
+            reconnect_needed = ntrip_config.enabled;
+        }
+
+        // Periodic config poll to avoid missed events (once per second)
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_config_poll) >= 1000000) {
+            last_config_poll = now_us;
+            ntrip_config_t polled_config;
+            if (config_get_ntrip(&polled_config) == ESP_OK) {
+                if (polled_config.enabled != ntrip_config.enabled) {
+                    ESP_LOGI(TAG, "NTRIP enabled changed via poll: %s -> %s",
+                             ntrip_config.enabled ? "true" : "false",
+                             polled_config.enabled ? "true" : "false");
+                    // Update local copy
+                    ntrip_config = polled_config;
+                    if (!ntrip_config.enabled && ntrip_connected) {
+                        ESP_LOGI(TAG, "Polling detected disable, disconnecting NTRIP");
+                        client->disconnect();
+                        ntrip_connected = false;
+                        reconnect_needed = false;
+                    } else if (ntrip_config.enabled && !ntrip_connected) {
+                        reconnect_needed = true;
+                    }
+                } else {
+                    // Keep other fields fresh in case they changed without events
+                    ntrip_config = polled_config;
+                }
+            }
         }
         
         // Handle connection state
@@ -136,6 +192,7 @@ static void ntrip_client_task(void* pvParameters) {
                 
                 if (connect_success && client->isConnected()) {
                     ntrip_connected = true;
+                    ntrip_connection_start = time(NULL);
                     last_gga_time = -1; // Set to -1 to trigger immediate GGA send on first message
                     ESP_LOGI(TAG, "Successfully connected to NTRIP caster, waiting for first GGA");
                 } else {
@@ -172,10 +229,16 @@ static void ntrip_client_task(void* pvParameters) {
                 if (bytes_read < 0) {
                     // Read error - connection lost
                     ESP_LOGW(TAG, "Read error, marking connection as lost");
+                    if (ntrip_connected && ntrip_connection_start > 0) {
+                        ntrip_uptime_accumulated += (time(NULL) - ntrip_connection_start);
+                    }
                     ntrip_connected = false;
                     reconnect_needed = true;
                 } else if (bytes_read > 0) {
                     rtcm_msg.length = bytes_read;
+                    
+                    // Update statistics (assume 1 message per read for now)
+                    statistics_rtcm_received(bytes_read, 1);
                     
                     // Notify LED task of RTCM data activity
                     led_update_ntrip_activity();
@@ -298,6 +361,13 @@ esp_err_t ntrip_client_task_init(void) {
 
 bool ntrip_client_is_connected(void) {
     return ntrip_connected;
+}
+
+uint32_t ntrip_get_uptime_sec(void) {
+    if (ntrip_connected && ntrip_connection_start > 0) {
+        return ntrip_uptime_accumulated + (time(NULL) - ntrip_connection_start);
+    }
+    return ntrip_uptime_accumulated;
 }
 
 esp_err_t ntrip_client_task_stop(void) {

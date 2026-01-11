@@ -192,7 +192,10 @@ Configuration Manager (config.h/cpp):
 		char topic[64];
 		char user[32];
 		char password[64];
-		bool enabled;  // Default: true
+		uint16_t gnss_interval_sec;    // Default: 10
+		uint16_t status_interval_sec;  // Default: 120
+		uint16_t stats_interval_sec;   // Default: 60
+		bool enabled;                  // Default: true
 	} mqtt_config_t;
 	
 	typedef struct {
@@ -225,6 +228,9 @@ JSON Configuration Format:
 			"topic": "ntripclient",
 			"user": "mqtt_user",
 			"password": "mqtt_user_password",
+			"gnss_interval_sec": 10,
+			"status_interval_sec": 120,
+			"stats_interval_sec": 60,
 			"enabled": true
 		}
 	}
@@ -332,6 +338,9 @@ httpd_start(&server, &config);
         "topic": "ntripclient",
         "user": "mqttuser",
         "password": "********",
+        "gnss_interval_sec": 10,
+        "status_interval_sec": 120,
+        "stats_interval_sec": 60,
         "enabled": true
     }
 }
@@ -888,12 +897,18 @@ esp_http_client_set_header(client, "Ntrip-Version", "Ntrip/2.0");
 
 **Input Processing (GPS → ESP32)**:
 1. Continuously read NMEA sentences from GPS receiver
-2. Parse and validate NMEA messages
-3. Store the following sentences for other tasks:
-   - **GGA** (Global Positioning System Fix Data)
-   - **RMC** (Recommended Minimum Specific GNSS Data)
-   - **VTG** (Track Made Good and Ground Speed)
-4. Provide thread-safe access to latest NMEA data via getters
+2. Parse and validate NMEA messages (checksum verification)
+3. Extract and store data from the following sentences:
+   - **GGA** (Global Positioning System Fix Data): lat, lon, alt, fix quality, satellites, HDOP, DGPS age
+   - **RMC** (Recommended Minimum Specific GNSS Data): date, time, lat, lon, speed, course
+   - **VTG** (Track Made Good and Ground Speed): true heading, ground speed
+4. **Centralized Parsing and Conversion**:
+   - Convert NMEA coordinates (DDMM.MMMMM) to decimal degrees (DD.DDDDDDD)
+   - Convert speed from knots to m/s
+   - Format date/time as ISO 8601 string
+   - Store all parsed data in `gnss_data_t` structure
+5. Provide thread-safe access to parsed GNSS data via mutex-protected getters
+6. Store raw NMEA sentences for reference (GGA for NTRIP Client)
 
 **Output Processing (ESP32 → GPS)**:
 1. Receive RTCM correction packets from NTRIP Client Task via queue
@@ -911,11 +926,28 @@ esp_http_client_set_header(client, "Ntrip-Version", "Ntrip/2.0");
 
 ```c
 typedef struct {
+    // Raw NMEA sentences (for reference/logging)
     char gga[128];      // Latest GGA sentence
     char rmc[128];      // Latest RMC sentence
     char vtg[128];      // Latest VTG sentence
-    time_t timestamp;   // Last update time
-    bool valid;         // Data validity flag
+    
+    // Parsed position data (ready for consumption by other tasks)
+    double latitude;           // Decimal degrees (DD.DDDDDDD)
+    double longitude;          // Decimal degrees (DD.DDDDDDD)
+    float altitude;            // Meters above sea level
+    float speed;               // Ground speed in m/s (converted from knots)
+    float heading;             // True heading in degrees (0-359.99)
+    
+    // Fix quality indicators
+    uint8_t fix_quality;       // GGA field 6: 0=no fix, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK float
+    uint8_t satellites;        // Number of satellites in fix
+    float hdop;                // Horizontal dilution of precision
+    float dgps_age;            // Age of differential corrections in seconds
+    
+    // Timestamp
+    char datetime_iso8601[32]; // ISO 8601 format: "YYYY-MM-DD HH:mm:ss.SSS"
+    time_t timestamp;          // Last update time (system time)
+    bool valid;                // Data validity flag
 } gnss_data_t;
 
 typedef struct {
@@ -932,10 +964,45 @@ typedef struct {
 - **rtcm_queue**: Receives RTCM packets from NTRIP Client (input)
 - **gga_queue**: Sends GGA to NTRIP Client (output)
 
+### NMEA Parsing Implementation:
+
+**Coordinate Conversion** (NMEA DDMM.MMMMM → Decimal Degrees DD.DDDDDDD):
+```c
+// Example: GGA latitude = "5212.688959,N" → 52.211483
+// Example: GGA longitude = "00559.0198035,E" → 5.983663
+
+double nmea_to_decimal_degrees(double nmea_value, char direction) {
+    int degrees = (int)(nmea_value / 100.0);
+    double minutes = nmea_value - (degrees * 100.0);
+    double decimal = degrees + (minutes / 60.0);
+    
+    // Apply hemisphere sign
+    if (direction == 'S' || direction == 'W') {
+        decimal = -decimal;
+    }
+    return decimal;
+}
+```
+
+**Speed Conversion** (Knots → m/s):
+```c
+float speed_ms = speed_knots * 0.514444;
+```
+
+**ISO 8601 Date-Time Formatting**:
+```c
+// From RMC date (DDMMYY) and time (HHMMSS.sss)
+// Format: "2025-03-28 10:27:06.200"
+sprintf(gnss_data.datetime_iso8601, "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+        year, month, day, hour, minute, second, millisecond);
+```
+
 ### Implementation Notes:
 - Use UART event queue for efficient RX processing
 - Implement NMEA sentence parsing and checksum validation
 - Handle partial sentences and buffer overflow gracefully
+- **All NMEA parsing done once in this task** - other tasks consume pre-parsed data
+- Update `gnss_data` structure atomically with mutex protection
 - Log GNSS status (fix quality, satellites, HDOP)
 
 ---
@@ -981,12 +1048,21 @@ If any byte in the message data or CRC-16 equals 0x01, 0x18, or 0x10, insert esc
 
 **Message String Structure** (before framing):
 ```
-DATE,TIME,LAT,LON,ALT,HEADING,SPEED
+YYYY-MM-DD HH:mm:ss.sss,LAT,LON,ALT,HEADING,SPEED
 ```
 
+**Date-Time Format**:
+Follows **ISO 8601** standard:
+- **YYYY-MM-DD HH:mm:ss.sss**
+- **YYYY**: 4-digit year (e.g., 2026)
+- **MM**: 2-digit month (01-12)
+- **DD**: 2-digit day (01-31)
+- **HH**: 2-digit hour in 24-hour format (00-23)
+- **mm**: 2-digit minutes (00-59)
+- **ss**: 2-digit seconds (00-59)
+- **sss**: 3-digit milliseconds (000-999)
+
 **Field Definitions**:
-- **DATE**: DDMMYY (e.g., 100126 for Jan 10, 2026)
-- **TIME**: HHMMSS.sss (e.g., 143052.123)
 - **LAT**: Decimal degrees, signed (e.g., -34.123456)
 - **LON**: Decimal degrees, signed (e.g., 150.987654)
 - **ALT**: Altitude in meters (e.g., 123.45)
@@ -995,7 +1071,7 @@ DATE,TIME,LAT,LON,ALT,HEADING,SPEED
 
 **Example Raw Message String**:
 ```
-100126,143052.123,-34.123456,150.987654,123.45,270.15,45.67
+2026-01-10 14:30:52.123,-34.123456,150.987654,123.45,270.15,45.67
 ```
 
 **Example Complete Frame** (hex representation, assuming CRC = 0xA3B2):
@@ -1016,11 +1092,10 @@ If CRC high byte (0xA3) or low byte (0xB2) were 0x01, 0x10, or 0x18, they would 
 - **Byte Order**: Big-endian (high byte first)
 
 ### Data Source:
-- Retrieve latest GNSS data from GNSS Receiver Task
-- Parse RMC for date, time, lat, lon, speed
-- Parse GGA for altitude
-- Parse VTG for heading
-- Handle missing or invalid data gracefully
+- Retrieve latest GNSS data from GNSS Receiver Task via `gnss_get_data()` with mutex
+- All NMEA parsing performed centrally in GNSS Receiver Task
+- Data already in required format (decimal degrees, m/s, ISO 8601)
+- Handle missing or invalid data gracefully (check `valid` flag)
 
 ### Data Structures:
 
@@ -1371,13 +1446,1137 @@ void updateNeopixel(uint8_t r, uint8_t g, uint8_t b) {
 
 ---
 
+## Statistics Task
+
+**Purpose**: Monitor, aggregate, and track system performance metrics and operational statistics for RTK/NTRIP client operation, GPS fix quality, and overall system health.
+
+**Runtime Control**: 
+- **Enabled by default** - tracks critical operational metrics
+- **Configurable logging interval** - can be set via configuration (default: 60 seconds)
+- **RAM-based storage** - statistics held in RAM, reset on reboot (not persisted to NVS)
+
+### Configuration:
+- **Update Rate**: 1000 ms (1 Hz) for metric collection
+- **Log Interval**: 60 seconds (configurable) for summary output
+- **Stack Size**: 4096 bytes
+- **Task Priority**: 1 (lower than data processing tasks)
+- **Storage**: All statistics held in RAM, reset on system reboot
+
+### Tracked Key Performance Indicators (KPIs):
+
+**Legend:**
+- **[Runtime]** - Cumulative from boot, total lifetime statistics
+- **[Period]** - For the duration of the current log interval only
+
+#### 1. NTRIP Connection Metrics
+- **Connection uptime** [Runtime] (seconds and percentage of total runtime)
+- **Reconnection count** [Runtime] (number of disconnect/reconnect cycles)
+- **Average reconnection time** [Runtime] (seconds from disconnect to reestablished connection)
+- **Connection state duration** [Runtime] (cumulative time in connected/disconnected states)
+- **Authentication failures** [Runtime] (count of failed login attempts)
+- **Last connection state change** [Runtime] (timestamp)
+
+#### 2. RTCM Data Flow Statistics
+- **RTCM messages received** [Runtime] (total count by message type: 1005, 1077, 1087, 1097, etc.)
+- **RTCM messages received** [Period] (count in current interval)
+- **RTCM message rate** [Period] (messages per second, instantaneous)
+- **Average RTCM latency** [Period] (age of corrections, if available from message timestamps)
+- **RTCM data gaps** [Runtime] (total count of periods without data >5 seconds)
+- **RTCM data gaps** [Period] (count and total duration in current interval)
+- **Corrupted/invalid RTCM messages** [Runtime] (total count of checksum or format errors)
+- **Corrupted/invalid RTCM messages** [Period] (count in current interval)
+- **Queue overflow events** [Runtime] (total count of times rtcm_queue was full)
+- **Queue overflow events** [Period] (count in current interval)
+
+#### 3. GPS Fix Quality Progression Metrics
+- **Time to first fix** [Runtime] (seconds from system boot to first GPS fix)
+- **Time to RTK float** [Runtime] (seconds from first GPS fix to RTK float acquisition)
+- **Time to RTK fixed** [Runtime] (seconds from RTK float to RTK fixed)
+- **Fix quality distribution** [Runtime] (cumulative time spent in each state):
+  - No fix (quality = 0)
+  - GPS/SPS (quality = 1)
+  - DGPS (quality = 2)
+  - RTK Float (quality = 5)
+  - RTK Fixed (quality = 4)
+- **Fix quality distribution** [Period] (time in each state during current interval)
+- **RTK fixed stability** [Runtime] (percentage of total runtime maintaining RTK fixed solution)
+- **RTK fixed stability** [Period] (percentage of current interval in RTK fixed)
+- **Fix downgrades** [Runtime] (total count of quality downgrades: RTK fixed → float, float → GPS, etc.)
+- **Fix downgrades** [Period] (count in current interval)
+- **Fix upgrade events** [Runtime] (total count of quality improvements)
+- **Fix upgrade events** [Period] (count in current interval)
+- **Current fix duration** [Runtime] (time spent in current fix quality state since last change)
+
+#### 4. Position Accuracy Indicators
+- **HDOP statistics** [Period] (current, minimum, maximum, average over interval)
+- **Number of satellites** [Period] (current, min, max, average over interval)
+
+#### 5. GGA Transmission Statistics
+- **GGA queue overflow events** [Runtime] (total count)
+- **GGA queue overflow events** [Period] (count in current interval)
+
+#### 6. System Health Metrics
+- **WiFi connection uptime** [Runtime] (percentage of total runtime)
+- **WiFi connection uptime** [Period] (percentage of current interval)
+- **WiFi signal strength** [Period] (current RSSI in dBm, min, max, average over interval)
+- **WiFi signal strength** [Runtime] (min and max RSSI since boot)
+- **WiFi reconnection count** [Runtime] (total number of WiFi disconnect/reconnect cycles)
+- **WiFi reconnection count** [Period] (count in current interval)
+- **Task stack high water marks** [Runtime] (minimum free stack bytes for each task since boot):
+  - NTRIP Client Task
+  - GNSS Receiver Task
+  - Data Output Task
+  - Statistics Task
+  - LED Indicator Task
+- **Heap memory statistics** [Runtime]:
+  - Free heap (current bytes)
+  - Minimum free heap (lowest value since boot)
+  - Largest free block
+- **CPU usage per task** [Period] (percentage, if FreeRTOS runtime stats enabled)
+- **System uptime** [Runtime] (total seconds since boot)
+
+#### 7. Error Tracking
+- **NMEA checksum errors** [Runtime] (total count of invalid NMEA sentences from GPS)
+- **NMEA checksum errors** [Period] (count in current interval)
+- **UART errors** [Runtime] (total count for both GPS UART2 and telemetry UART1):
+  - Buffer overflows
+  - Framing errors
+  - Parity errors (if applicable)
+- **UART errors** [Period] (count in current interval)
+- **NTRIP timeout events** [Runtime] (total count of connection timeouts)
+- **NTRIP timeout events** [Period] (count in current interval)
+- **Configuration load failures** [Runtime] (total count of NVS read errors)
+- **Memory allocation failures** [Runtime] (total count of malloc/pvPortMalloc failures)
+- **Task creation failures** [Runtime] (total count)
+
+#### 8. Performance Metrics
+- **GNSS data update rate** [Period] (Hz, actual vs expected 10 Hz)
+- **Telemetry output rate** [Period] (Hz, actual vs configured 10 Hz)
+- **Average task loop time** [Period] (milliseconds per iteration for each task)
+- **Event notification latency** [Period] (time from GNSS update event to telemetry transmission)
+- **Queue utilization** [Runtime] (peak item count for rtcm_queue and gga_queue since boot)
+- **Queue utilization** [Period] (current and average item count in current interval)
+
+### Data Structures:
+
+```c
+typedef struct {
+    uint32_t interval_sec;        // Logging interval in seconds
+    bool enabled;                 // Enable/disable statistics collection
+    bool web_api_enable;          // Enable HTTP API for statistics
+    bool mqtt_publish;            // Publish statistics via MQTT
+} statistics_config_t;
+
+// Runtime statistics - cumulative from boot
+typedef struct {
+    // NTRIP metrics [Runtime]
+    uint32_t ntrip_uptime_sec;
+    uint32_t ntrip_reconnect_count;
+    uint32_t ntrip_avg_reconnect_time_ms;
+    uint32_t ntrip_auth_failures;
+    time_t last_connection_state_change;
+    
+    // RTCM metrics [Runtime]
+    uint64_t rtcm_bytes_received_total;
+    uint32_t rtcm_messages_received_total;
+    uint32_t rtcm_data_gaps_total;
+    uint32_t rtcm_corrupted_count_total;
+    uint32_t rtcm_queue_overflows_total;
+    
+    // GPS fix metrics [Runtime]
+    uint32_t time_to_first_fix_sec;
+    uint32_t time_to_rtk_float_sec;
+    uint32_t time_to_rtk_fixed_sec;
+    uint32_t fix_quality_duration_total[9];  // Seconds in each fix quality state
+    uint32_t fix_downgrades_total;
+    uint32_t fix_upgrades_total;
+    uint32_t current_fix_duration_sec;       // Time in current state
+    
+    // Accuracy metrics [Runtime]
+    float hdop_min_boot;
+    float hdop_max_boot;
+    uint8_t satellites_min_boot;
+    uint8_t satellites_max_boot;
+    
+    // GGA transmission [Runtime]
+    uint32_t gga_sent_count_total;
+    uint32_t gga_send_failures_total;
+    uint32_t gga_queue_overflows_total;
+    time_t last_gga_sent_time;
+    
+    // System health [Runtime]
+    uint32_t wifi_uptime_sec;
+    int8_t wifi_rssi_min_boot;
+    int8_t wifi_rssi_max_boot;
+    uint32_t wifi_reconnect_count_total;
+    uint32_t heap_min_free_bytes;
+    uint32_t stack_hwm_ntrip;
+    uint32_t stack_hwm_gnss;
+    uint32_t stack_hwm_dataout;
+    uint32_t stack_hwm_stats;
+    uint32_t stack_hwm_led;
+    uint32_t system_uptime_sec;
+    uint32_t rtcm_queue_peak_count;
+    uint32_t gga_queue_peak_count;
+    
+    // Error counters [Runtime]
+    uint32_t nmea_checksum_errors_total;
+    uint32_t uart_errors_total;
+    uint32_t ntrip_timeouts_total;
+    uint32_t config_load_failures_total;
+    uint32_t memory_alloc_failures_total;
+    uint32_t task_creation_failures_total;
+} runtime_statistics_t;
+
+// Period statistics - for current log interval only
+typedef struct {
+    // RTCM metrics [Period]
+    uint32_t rtcm_bytes_received;
+    uint32_t rtcm_bytes_per_sec;
+    uint32_t rtcm_messages_received;
+    uint32_t rtcm_message_rate;           // messages/sec
+    uint32_t rtcm_avg_latency_ms;
+    uint32_t rtcm_data_gaps;
+    uint32_t rtcm_gap_duration_sec;
+    uint32_t rtcm_corrupted_count;
+    uint32_t rtcm_queue_overflows;
+    
+    // GPS fix metrics [Period]
+    uint32_t fix_quality_duration[9];     // Seconds in each state this period
+    float rtk_fixed_stability_percent;
+    uint32_t fix_downgrades;
+    uint32_t fix_upgrades;
+    
+    // Accuracy metrics [Period]
+    float hdop_current;
+    float hdop_min;
+    float hdop_max;
+    float hdop_avg;
+    float estimated_accuracy_m;
+    uint8_t satellites_current;
+    uint8_t satellites_min;
+    uint8_t satellites_max;
+    uint8_t satellites_avg;
+    float baseline_distance_km;
+    
+    // GGA transmission [Period]
+    uint32_t gga_sent_count;
+    uint32_t gga_send_failures;
+    uint32_t gga_actual_interval_sec;
+    uint32_t gga_queue_overflows;
+    
+    // System health [Period]
+    uint32_t wifi_uptime_sec;
+    float wifi_uptime_percent;
+    int8_t wifi_rssi_dbm;
+    int8_t wifi_rssi_min;
+    int8_t wifi_rssi_max;
+    int8_t wifi_rssi_avg;
+    uint32_t wifi_reconnect_count;
+    uint32_t heap_free_bytes;
+    uint32_t heap_largest_block;
+    float cpu_usage_percent[5];           // Per task if available
+    
+    // Error counters [Period]
+    uint32_t nmea_checksum_errors;
+    uint32_t uart_errors;
+    uint32_t ntrip_timeouts;
+    
+    // Performance metrics [Period]
+    uint32_t gnss_update_rate_hz;
+    uint32_t telemetry_output_rate_hz;
+    uint32_t avg_task_loop_time_ms[5];
+    uint32_t event_latency_ms;
+    uint32_t rtcm_queue_avg_count;
+    uint32_t gga_queue_avg_count;
+} period_statistics_t;
+
+// Combined statistics structure
+typedef struct {
+    runtime_statistics_t runtime;
+    period_statistics_t period;
+    time_t period_start_time;            // Timestamp when current period started
+    uint32_t period_duration_sec;        // Actual duration of completed period
+} system_statistics_t;
+```
+
+### Responsibilities:
+
+**Metric Collection**:
+1. Query task handles for stack high water marks using `uxTaskGetStackHighWaterMark()`
+2. Read heap statistics using `esp_get_free_heap_size()` and `esp_get_minimum_free_heap_size()`
+3. Monitor WiFi RSSI using `esp_wifi_sta_get_ap_info()`
+4. Track event timestamps for latency calculations
+5. Subscribe to events from other tasks via event groups or direct function calls
+
+**Data Aggregation**:
+1. Calculate running averages (HDOP, RSSI, latencies)
+2. Track min/max values for bounded metrics
+3. Accumulate counters for events
+4. Calculate percentages and rates
+
+**Logging and Output**:
+1. Log summary statistics at configured interval (ESP_LOGI)
+2. Format statistics for web interface HTTP API (JSON response)
+3. Optionally publish key metrics via MQTT for remote monitoring
+4. Statistics held in RAM only - reset to zero on system reboot
+
+**Critical Metrics Dashboard** (Priority Display):
+1. **Current fix quality & estimated accuracy**
+2. **NTRIP connection status & uptime percentage**
+3. **RTCM data rate & last message time**
+4. **Time in RTK fixed state (session and total)**
+5. **Satellites visible & current HDOP**
+6. **WiFi signal strength & connection status**
+7. **System uptime & free memory**
+
+### Implementation Notes:
+- Task priority: 1 (lowest, runs during idle periods)
+- Stack size: 4096 bytes (needs space for JSON formatting)
+- Update rate: 1 Hz (adequate for most metrics)
+- **Statistics stored in RAM only** - all counters reset to zero on reboot
+- Use shared counters with atomic operations or mutexes for thread safety
+- Provide HTTP REST API endpoint: `GET /api/stats` returns JSON
+- Optionally integrate with MQTT for remote dashboard
+- Statistics reset on power cycle - consider MQTT logging for historical tracking
+- Consider adding statistics reset function via web interface
+- Log warnings when critical thresholds exceeded (low heap, high error rates)
+
+### Example HTTP API Response:
+```json
+{
+  "system": {
+    "uptime_sec": 3600,
+    "heap_free": 245678,
+    "heap_min": 198432
+  },
+  "ntrip": {
+    "connected": true,
+    "uptime_percent": 98.5,
+    "rtcm_rate_bps": 156,
+    "reconnects": 2
+  },
+  "gnss": {
+    "fix_quality": 4,
+    "accuracy_m": 0.015,
+    "satellites": 18,
+    "hdop": 0.8,
+    "rtk_fixed_percent": 95.2
+  },
+  "wifi": {
+    "connected": true,
+    "rssi_dbm": -65,
+    "uptime_percent": 99.1
+  }
+}
+```
+
+---
+
+## MQTT Client Task
+
+**Purpose**: Publish real-time GPS position, fix quality, and navigation data to MQTT broker for remote monitoring, data logging, and integration with telemetry systems.
+
+**Runtime Control**: 
+- **Enabled by default** - can be disabled via configuration (`enabled` flag)
+- **Automatic restart** - when configuration changes, task disconnects and reconnects with new settings
+- **Graceful shutdown** - when disabled, cleanly disconnects from broker and stops operation
+
+### Configuration:
+- **Protocol**: MQTT v3.1.1 or v5.0
+- **Port**: Typically 1883 (unencrypted) or 8883 (TLS/SSL)
+- **QoS Level**: 0 (at most once) for position data, 1 (at least once) for critical events
+- **Publish Intervals** (configurable, 0=disabled):
+  - **GNSS Position**: 10 seconds (default, range: 0-300 seconds)
+  - **System Status**: 120 seconds (default, range: 0-600 seconds)
+  - **Statistics**: 60 seconds (default, range: 0-600 seconds)
+- **Keep-Alive**: 60 seconds
+- **Clean Session**: True (start fresh on reconnect)
+- **Reconnection**: Auto-reconnect on disconnect with exponential backoff
+
+### Responsibilities:
+
+**Connection Management**:
+1. Read MQTT configuration from NVS (broker, port, topic, user, password)
+2. Establish TCP connection to MQTT broker
+3. Send CONNECT packet with authentication credentials
+4. Maintain persistent connection with periodic PINGREQ/PINGRESP
+5. Handle disconnections with retry logic (exponential backoff: 1s, 2s, 4s, max 60s)
+6. Subscribe to command topics for remote control (optional future feature)
+
+**GNSS Position Data Publishing** (`<base>/GNSS` topic):
+1. Read latest GNSS data from shared `gnss_data` structure (with mutex via `gnss_get_data()`)
+2. **All NMEA parsing performed centrally in GNSS Receiver Task** - data already in required format
+3. Map parsed data fields to JSON message structure
+4. Publish to `<base>/GNSS` topic every 10 seconds (configurable)
+5. Track message sequence number (incrementing from system boot)
+6. Log publish success/failure for statistics tracking
+
+**System Status Publishing** (`<base>/status` topic):
+1. Collect cumulative runtime status from all subsystems
+2. Query WiFi Manager for connection status and signal strength
+3. Query NTRIP Client for connection status and data counters
+4. Query Statistics Task for system health metrics (heap, uptime)
+5. Format as JSON message
+6. Publish to `<base>/status` topic every 120 seconds (configurable)
+7. Provides overall system health snapshot
+
+**Statistics Publishing** (`<base>/stats` topic):
+1. Query Statistics Task for current period statistics
+2. Retrieve interval-based metrics (rates, averages, event counts)
+3. Format as JSON message
+4. Publish to `<base>/stats` topic every 60 seconds (configurable)
+5. Provides detailed performance metrics for monitoring/analysis
+
+**Data Mapping** (from centralized `gnss_data_t`):
+- `latitude` → `lat` (already in decimal degrees DD.DDDDDDD)
+- `longitude` → `lon` (already in decimal degrees DD.DDDDDDD)
+- `altitude` → `alt` (already in meters)
+- `fix_quality` → `fix_type` (already parsed from GGA field 6)
+- `dgps_age` → `age` (already parsed from GGA field 13)
+- `hdop` → `hdop` (already parsed from GGA field 8)
+- `satellites` → `sats` (already parsed from GGA field 7)
+- `speed` → `speed` (already converted to m/s)
+- `heading` → `dir` (already in degrees)
+- `datetime_iso8601` → `daytime` (already formatted)
+
+**Error Handling**:
+- Connection refused: Invalid credentials or broker unavailable → log error, retry with backoff
+- Publish failure: Network loss or buffer full → cache message or discard (based on QoS)
+- Timeout: No PINGRESP received → reconnect
+- Network loss: Detect WiFi disconnect event, wait for reconnection
+
+### Data Structures:
+
+**Configuration Structure:**
+```c
+typedef struct {
+    char broker[128];              // MQTT broker hostname
+    uint16_t port;                 // MQTT broker port (1883/8883)
+    char topic[64];                // Base topic (e.g., "ntripclient")
+    char user[32];                 // MQTT username
+    char password[64];             // MQTT password
+    uint16_t gnss_interval_sec;    // GNSS publish interval (default: 10)
+    uint16_t status_interval_sec;  // Status publish interval (default: 120)
+    uint16_t stats_interval_sec;   // Stats publish interval (default: 60)
+    bool enabled;                  // Enable/disable MQTT client
+} mqtt_config_t;
+```
+
+See also `mqtt_config_t` in Configuration Manager section for JSON format.
+
+**Runtime Status:**
+```c
+typedef struct {
+    bool connected;
+    uint32_t messages_published;
+    uint32_t publish_failures;
+    time_t last_publish_time;
+    char last_error[64];
+} mqtt_status_t;
+```
+
+**MQTT Message Structures:**
+
+**GNSS Position Message:**
+```c
+typedef struct {
+    uint32_t num;                // Message sequence number
+    char daytime[32];            // ISO 8601 format: "YYYY-MM-DD HH:mm:ss.SSS"
+    double lat;                  // Latitude in decimal degrees
+    double lon;                  // Longitude in decimal degrees
+    float alt;                   // Altitude in meters ASL
+    uint8_t fix_type;            // NMEA GGA fix quality
+    float speed;                 // Speed in m/s
+    float dir;                   // True heading in degrees
+    uint8_t sats;                // Number of satellites
+    float hdop;                  // Horizontal dilution of precision
+    float age;                   // Age of differential in seconds
+} mqtt_gnss_message_t;
+```
+
+**System Status Message:**
+```c
+typedef struct {
+    char timestamp[32];          // ISO 8601 timestamp
+    uint32_t uptime_sec;         // System uptime since boot
+    uint32_t heap_free;          // Current free heap bytes
+    uint32_t heap_min;           // Minimum free heap since boot
+    bool wifi_connected;         // WiFi STA connection status
+    int8_t wifi_rssi;            // WiFi signal strength (dBm)
+    bool ntrip_connected;        // NTRIP connection status
+    uint32_t ntrip_uptime_sec;   // NTRIP cumulative connection time
+    uint32_t rtcm_packets_total; // Total RTCM packets received
+    bool mqtt_connected;         // MQTT connection status
+    uint32_t mqtt_uptime_sec;    // MQTT cumulative connection time
+    uint32_t mqtt_published;     // Total messages published
+    uint8_t current_fix;         // Current GPS fix quality
+} mqtt_status_message_t;
+```
+
+**Statistics Message:**
+```c
+typedef struct {
+    char timestamp[32];          // ISO 8601 timestamp
+    uint32_t period_duration;    // Statistics period duration in seconds
+    
+    // RTCM statistics (period)
+    uint32_t rtcm_bytes_received;
+    uint32_t rtcm_message_rate;  // messages/sec
+    uint32_t rtcm_data_gaps;
+    
+    // GNSS statistics (period)
+    uint32_t fix_quality_duration[9]; // Seconds in each fix state
+    float rtk_fixed_percent;     // Percentage in RTK fixed this period
+    float hdop_avg;              // Average HDOP
+    uint8_t sats_avg;            // Average satellites
+    
+    // System health (period)
+    int8_t wifi_rssi_avg;        // Average WiFi RSSI
+    uint32_t wifi_uptime_percent;// WiFi uptime percentage
+    
+    // Errors (period)
+    uint32_t nmea_errors;        // NMEA checksum errors
+    uint32_t uart_errors;        // UART errors
+    uint32_t rtcm_queue_overflows; // RTCM queue overflows
+} mqtt_stats_message_t;
+```
+
+### JSON Message Formats:
+
+**Topic Structure**:
+```
+<base_topic>/GNSS       - Position data every 10 seconds
+<base_topic>/status     - System status every 120 seconds (cumulative)
+<base_topic>/stats      - Period statistics every 60 seconds
+```
+
+Example: If `base_topic` is configured as `"ntripclient"`, the full topics are:
+```
+ntripclient/GNSS
+ntripclient/status
+ntripclient/stats
+```
+
+### 1. GNSS Position Message (`<base>/GNSS`)
+
+**Message Payload Example**:
+```json
+{
+   "num": 1357720,
+   "daytime": "2025-03-28 10:27:06.200",
+   "lat": 52.211483,
+   "lon": 5.983663,
+   "alt": 21.394,
+   "fix_type": 5,
+   "speed": 0.0,
+   "dir": 334.2,
+   "sats": 31,
+   "hdop": 0.48,
+   "age": 2.2
+}
+```
+
+**Field Specifications**:
+
+| Field | Type | Description | Unit/Format |
+|-------|------|-------------|-------------|
+| **num** | Integer | Incrementing message number from system boot | Count |
+| **daytime** | String | Position timestamp in ISO 8601 format | "YYYY-MM-DD HH:mm:ss.SSS" |
+| **lat** | Float | Latitude in decimal degrees | DD.DDDDDDD |
+| **lon** | Float | Longitude in decimal degrees | DD.DDDDDDD |
+| **alt** | Float | Altitude above sea level | meters |
+| **fix_type** | Integer (uint8_t) | GPS fix quality from GGA sentence | 0-8 (see table below) |
+| **speed** | Float | Ground speed | m/s |
+| **dir** | Float | True heading (course over ground) | degrees (0-359.99) |
+| **sats** | Integer | Number of satellites in fix | count |
+| **hdop** | Float | Horizontal dilution of precision | dimensionless |
+| **age** | Float | Time since last differential correction | seconds |
+
+**NMEA 0183 - GGA Sentence Fix Types**:
+```c
+0 = No fix / Invalid
+1 = GPS fix (SPS)
+2 = DGPS fix
+3 = PPS fix
+4 = RTK Fixed
+5 = RTK Float
+6 = Estimated (dead reckoning)
+7 = Manual input mode
+8 = Simulation mode
+```
+
+---
+
+### 2. System Status Message (`<base>/status`)
+
+**Published**: Every 120 seconds (configurable)
+
+**Purpose**: Cumulative runtime status and overall system health
+
+**Message Payload Example**:
+```json
+{
+   "timestamp": "2025-03-28 10:27:06.200",
+   "uptime_sec": 7325,
+   "heap_free": 245678,
+   "heap_min": 198432,
+   "wifi": {
+      "connected": true,
+      "rssi_dbm": -65
+   },
+   "ntrip": {
+      "connected": true,
+      "uptime_sec": 7120,
+      "rtcm_packets_total": 8234
+   },
+   "mqtt": {
+      "connected": true,
+      "uptime_sec": 7200,
+      "messages_published": 732
+   },
+   "gnss": {
+      "current_fix": 4
+   }
+}
+```
+
+**Field Specifications**:
+
+| Field | Type | Description | Unit/Format |
+|-------|------|-------------|-------------|
+| **timestamp** | String | Message timestamp | "YYYY-MM-DD HH:mm:ss.SSS" |
+| **uptime_sec** | Integer | System uptime since boot | seconds |
+| **heap_free** | Integer | Current free heap memory | bytes |
+| **heap_min** | Integer | Minimum free heap since boot | bytes |
+| **wifi.connected** | Boolean | WiFi STA connection status | true/false |
+| **wifi.rssi_dbm** | Integer | Current WiFi signal strength | dBm (-100 to 0) |
+| **ntrip.connected** | Boolean | NTRIP client connection status | true/false |
+| **ntrip.uptime_sec** | Integer | Cumulative NTRIP connection time | seconds |
+| **ntrip.rtcm_packets_total** | Integer | Total RTCM packets received since boot | count |
+| **mqtt.connected** | Boolean | MQTT broker connection status | true/false |
+| **mqtt.uptime_sec** | Integer | Cumulative MQTT connection time | seconds |
+| **mqtt.messages_published** | Integer | Total MQTT messages published since boot | count |
+| **gnss.current_fix** | Integer | Current GPS fix quality | 0-8 (see NMEA table) |
+
+---
+
+### 3. Statistics Message (`<base>/stats`)
+
+**Published**: Every 60 seconds (configurable)
+
+**Purpose**: Detailed performance metrics for the last measurement period
+
+**Message Payload Example**:
+```json
+{
+   "timestamp": "2025-03-28 10:27:06.200",
+   "period_sec": 60,
+   "rtcm": {
+      "bytes_received": 9856,
+      "message_rate": 3,
+      "data_gaps": 0
+   },
+   "gnss": {
+      "fix_duration": {
+         "no_fix": 0,
+         "gps": 0,
+         "dgps": 0,
+         "rtk_float": 8,
+         "rtk_fixed": 52
+      },
+      "rtk_fixed_percent": 86.7,
+      "hdop_avg": 0.52,
+      "sats_avg": 29
+   },
+   "wifi": {
+      "rssi_avg": -67,
+      "uptime_percent": 100.0
+   },
+   "errors": {
+      "nmea_checksum": 0,
+      "uart": 0,
+      "rtcm_queue_overflow": 0
+   }
+}
+```
+
+**Field Specifications**:
+
+| Field | Type | Description | Unit/Format |
+|-------|------|-------------|-------------|
+| **timestamp** | String | Message timestamp | "YYYY-MM-DD HH:mm:ss.SSS" |
+| **period_sec** | Integer | Statistics collection period | seconds |
+| **rtcm.bytes_received** | Integer | RTCM bytes received this period | bytes |
+| **rtcm.message_rate** | Integer | RTCM messages per second | msg/sec |
+| **rtcm.data_gaps** | Integer | Number of data gaps >5s this period | count |
+| **gnss.fix_duration.no_fix** | Integer | Seconds in no fix state | seconds |
+| **gnss.fix_duration.gps** | Integer | Seconds in GPS fix state | seconds |
+| **gnss.fix_duration.dgps** | Integer | Seconds in DGPS fix state | seconds |
+| **gnss.fix_duration.rtk_float** | Integer | Seconds in RTK float state | seconds |
+| **gnss.fix_duration.rtk_fixed** | Integer | Seconds in RTK fixed state | seconds |
+| **gnss.rtk_fixed_percent** | Float | Percentage of period in RTK fixed | percent (0-100) |
+| **gnss.hdop_avg** | Float | Average HDOP this period | dimensionless |
+| **gnss.sats_avg** | Integer | Average satellites this period | count |
+| **wifi.rssi_avg** | Integer | Average WiFi RSSI this period | dBm |
+| **wifi.uptime_percent** | Float | WiFi uptime this period | percent (0-100) |
+| **errors.nmea_checksum** | Integer | NMEA checksum errors this period | count |
+| **errors.uart** | Integer | UART errors this period | count |
+| **errors.rtcm_queue_overflow** | Integer | RTCM queue overflows this period | count |
+
+---
+
+**NMEA 0183 - GGA Sentence Fix Types** (reference):
+```c
+0 = No fix / Invalid
+1 = GPS fix (SPS)
+2 = DGPS fix
+3 = PPS fix
+4 = RTK Fixed
+5 = RTK Float
+6 = Estimated (dead reckoning)
+7 = Manual input mode
+8 = Simulation mode
+```
+
+### Data Flow:
+
+```
+GPS Receiver (UART2)
+    ↓ NMEA sentences
+GNSS Receiver Task
+    ↓ Parse & Convert (CENTRALIZED)
+    ├─ NMEA coordinates → Decimal degrees
+    ├─ Knots → m/s
+    └─ Format ISO 8601 timestamp
+    ↓ Store in gnss_data (mutex protected)
+MQTT Client Task
+    ↓ Read pre-parsed data
+    └─ Map to JSON → Publish
+```
+
+**Note**: All NMEA parsing and coordinate conversion performed once in GNSS Receiver Task. See GNSS Receiver Task section for conversion formulas.
+
+### Task Loop Structure:
+
+```c
+void vMQTTClientTask(void *pvParameters) {
+    mqtt_config_t config;
+    mqtt_gnss_message_t gnss_msg;
+    uint32_t message_counter = 0;
+    uint32_t gnss_counter = 0;
+    uint32_t status_counter = 0;
+    uint32_t stats_counter = 0;
+    
+    // Load configuration from NVS
+    loadMQTTConfig(&config);
+    
+    if (!config.enabled) {
+        ESP_LOGI(TAG, "MQTT client disabled in configuration");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Initialize MQTT client
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = config.broker,
+        .broker.address.port = config.port,
+        .credentials.username = config.user,
+        .credentials.password = config.password,
+    };
+    
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(client);
+    
+    while (1) {
+        // 1 second tick for interval management
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        
+        // Check if connected
+        if (!mqtt_is_connected()) {
+            continue;
+        }
+        
+        gnss_counter++;
+        status_counter++;
+        stats_counter++;
+        
+        // Publish GNSS position data
+        if (gnss_counter >= config.gnss_interval_sec) {
+            gnss_counter = 0;
+            
+            // Read latest GNSS data (already parsed by GNSS Receiver Task)
+            gnss_data_t gnss_data;
+            if (gnss_get_data(&gnss_data) && gnss_data.valid) {
+                // Map pre-parsed data to MQTT message structure
+                gnss_msg.lat = gnss_data.latitude;
+                gnss_msg.lon = gnss_data.longitude;
+                gnss_msg.alt = gnss_data.altitude;
+                gnss_msg.fix_type = gnss_data.fix_quality;
+                gnss_msg.speed = gnss_data.speed;
+                gnss_msg.dir = gnss_data.heading;
+                gnss_msg.sats = gnss_data.satellites;
+                gnss_msg.hdop = gnss_data.hdop;
+                gnss_msg.age = gnss_data.dgps_age;
+                strncpy(gnss_msg.daytime, gnss_data.datetime_iso8601, sizeof(gnss_msg.daytime));
+                gnss_msg.num = ++message_counter;
+                
+                // Format and publish
+                char json_buffer[512];
+                format_gnss_json(&gnss_msg, json_buffer, sizeof(json_buffer));
+                
+                char topic[128];
+                snprintf(topic, sizeof(topic), "%s/GNSS", config.topic);
+                esp_mqtt_client_publish(client, topic, json_buffer, strlen(json_buffer), 0, 0);
+                
+                ESP_LOGI(TAG, "Published GNSS #%lu", message_counter);
+            }
+        }
+        
+        // Publish system status (cumulative runtime data)
+        if (status_counter >= config.status_interval_sec) {
+            status_counter = 0;
+            
+            mqtt_status_message_t status_msg;
+            collect_system_status(&status_msg);
+            
+            char json_buffer[1024];
+            format_status_json(&status_msg, json_buffer, sizeof(json_buffer));
+            
+            char topic[128];
+            snprintf(topic, sizeof(topic), "%s/status", config.topic);
+            esp_mqtt_client_publish(client, topic, json_buffer, strlen(json_buffer), 0, 0);
+            
+            ESP_LOGI(TAG, "Published system status");
+        }
+        
+        // Publish period statistics
+        if (stats_counter >= config.stats_interval_sec) {
+            stats_counter = 0;
+            
+            mqtt_stats_message_t stats_msg;
+            collect_period_statistics(&stats_msg);
+            
+            char json_buffer[1024];
+            format_stats_json(&stats_msg, json_buffer, sizeof(json_buffer));
+            
+            char topic[128];
+            snprintf(topic, sizeof(topic), "%s/stats", config.topic);
+            esp_mqtt_client_publish(client, topic, json_buffer, strlen(json_buffer), 0, 0);
+            
+            ESP_LOGI(TAG, "Published statistics");
+        }
+    }
+}
+```
+
+### JSON Formatting Functions:
+
+**GNSS Position Message:**
+```c
+void format_gnss_json(const mqtt_gnss_message_t *msg, char *buffer, size_t size) {
+    snprintf(buffer, size,
+        "{\n"
+        "   \"num\": %lu,\n"
+        "   \"daytime\": \"%s\",\n"
+        "   \"lat\": %.7f,\n"
+        "   \"lon\": %.7f,\n"
+        "   \"alt\": %.3f,\n"
+        "   \"fix_type\": %u,\n"
+        "   \"speed\": %.2f,\n"
+        "   \"dir\": %.1f,\n"
+        "   \"sats\": %u,\n"
+        "   \"hdop\": %.2f,\n"
+        "   \"age\": %.1f\n"
+        "}",
+        msg->num,
+        msg->daytime,
+        msg->lat,
+        msg->lon,
+        msg->alt,
+        msg->fix_type,
+        msg->speed,
+        msg->dir,
+        msg->sats,
+        msg->hdop,
+        msg->age
+    );
+}
+```
+
+**System Status Message:**
+```c
+void format_status_json(const mqtt_status_message_t *msg, char *buffer, size_t size) {
+    snprintf(buffer, size,
+        "{\n"
+        "   \"timestamp\": \"%s\",\n"
+        "   \"uptime_sec\": %lu,\n"
+        "   \"heap_free\": %lu,\n"
+        "   \"heap_min\": %lu,\n"
+        "   \"wifi\": {\n"
+        "      \"connected\": %s,\n"
+        "      \"rssi_dbm\": %d\n"
+        "   },\n"
+        "   \"ntrip\": {\n"
+        "      \"connected\": %s,\n"
+        "      \"uptime_sec\": %lu,\n"
+        "      \"rtcm_packets_total\": %lu\n"
+        "   },\n"
+        "   \"mqtt\": {\n"
+        "      \"connected\": %s,\n"
+        "      \"uptime_sec\": %lu,\n"
+        "      \"messages_published\": %lu\n"
+        "   },\n"
+        "   \"gnss\": {\n"
+        "      \"current_fix\": %u\n"
+        "   }\n"
+        "}",
+        msg->timestamp,
+        msg->uptime_sec,
+        msg->heap_free,
+        msg->heap_min,
+        msg->wifi_connected ? "true" : "false",
+        msg->wifi_rssi,
+        msg->ntrip_connected ? "true" : "false",
+        msg->ntrip_uptime_sec,
+        msg->rtcm_packets_total,
+        msg->mqtt_connected ? "true" : "false",
+        msg->mqtt_uptime_sec,
+        msg->mqtt_published,
+        msg->current_fix
+    );
+}
+```
+
+**Statistics Message:**
+```c
+void format_stats_json(const mqtt_stats_message_t *msg, char *buffer, size_t size) {
+    snprintf(buffer, size,
+        "{\n"
+        "   \"timestamp\": \"%s\",\n"
+        "   \"period_sec\": %lu,\n"
+        "   \"rtcm\": {\n"
+        "      \"bytes_received\": %lu,\n"
+        "      \"message_rate\": %lu,\n"
+        "      \"data_gaps\": %lu\n"
+        "   },\n"
+        "   \"gnss\": {\n"
+        "      \"fix_duration\": {\n"
+        "         \"no_fix\": %lu,\n"
+        "         \"gps\": %lu,\n"
+        "         \"dgps\": %lu,\n"
+        "         \"rtk_float\": %lu,\n"
+        "         \"rtk_fixed\": %lu\n"
+        "      },\n"
+        "      \"rtk_fixed_percent\": %.1f,\n"
+        "      \"hdop_avg\": %.2f,\n"
+        "      \"sats_avg\": %u\n"
+        "   },\n"
+        "   \"wifi\": {\n"
+        "      \"rssi_avg\": %d,\n"
+        "      \"uptime_percent\": %.1f\n"
+        "   },\n"
+        "   \"errors\": {\n"
+        "      \"nmea_checksum\": %lu,\n"
+        "      \"uart\": %lu,\n"
+        "      \"rtcm_queue_overflow\": %lu\n"
+        "   }\n"
+        "}",
+        msg->timestamp,
+        msg->period_duration,
+        msg->rtcm_bytes_received,
+        msg->rtcm_message_rate,
+        msg->rtcm_data_gaps,
+        msg->fix_quality_duration[0],  // no_fix
+        msg->fix_quality_duration[1],  // gps
+        msg->fix_quality_duration[2],  // dgps
+        msg->fix_quality_duration[5],  // rtk_float
+        msg->fix_quality_duration[4],  // rtk_fixed
+        msg->rtk_fixed_percent,
+        msg->hdop_avg,
+        msg->sats_avg,
+        msg->wifi_rssi_avg,
+        msg->wifi_uptime_percent,
+        msg->nmea_errors,
+        msg->uart_errors,
+        msg->rtcm_queue_overflows
+    );
+}
+```
+
+### ESP-IDF MQTT Client Integration:
+
+The ESP-IDF provides a built-in MQTT client library:
+
+```c
+#include "mqtt_client.h"
+
+// Event handler for MQTT events
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT connected to broker");
+            set_mqtt_connected(true);
+            break;
+            
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "MQTT disconnected from broker");
+            set_mqtt_connected(false);
+            break;
+            
+        case MQTT_EVENT_PUBLISHED:
+            ESP_LOGI(TAG, "MQTT message published, msg_id=%d", event->msg_id);
+            break;
+            
+        case MQTT_EVENT_ERROR:
+            ESP_LOGE(TAG, "MQTT error: %s", strerror(event->error_handle->esp_transport_sock_errno));
+            break;
+            
+        default:
+            break;
+    }
+}
+```
+
+### Data Collection Functions:
+
+**Collect System Status** (cumulative runtime data):
+```c
+void collect_system_status(mqtt_status_message_t *msg) {
+    // Get current timestamp
+    format_iso8601_timestamp(msg->timestamp, sizeof(msg->timestamp));
+    
+    // System metrics
+    msg->uptime_sec = esp_timer_get_time() / 1000000;
+    msg->heap_free = esp_get_free_heap_size();
+    msg->heap_min = esp_get_minimum_free_heap_size();
+    
+    // WiFi status
+    msg->wifi_connected = wifi_manager_is_sta_connected();
+    if (msg->wifi_connected) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            msg->wifi_rssi = ap_info.rssi;
+        }
+    }
+    
+    // NTRIP status (from Statistics Task runtime data)
+    runtime_statistics_t *runtime_stats = statistics_get_runtime();
+    msg->ntrip_connected = ntrip_is_connected();
+    msg->ntrip_uptime_sec = runtime_stats->ntrip_uptime_sec;
+    msg->rtcm_packets_total = runtime_stats->rtcm_messages_received_total;
+    
+    // MQTT status
+    msg->mqtt_connected = true;  // We're publishing, so we're connected
+    msg->mqtt_uptime_sec = mqtt_get_uptime_sec();
+    msg->mqtt_published = mqtt_get_publish_count();
+    
+    // GNSS status
+    gnss_data_t gnss_data;
+    if (gnss_get_data(&gnss_data)) {
+        msg->current_fix = gnss_data.fix_quality;
+    }
+}
+```
+
+**Collect Period Statistics** (interval data from Statistics Task):
+```c
+void collect_period_statistics(mqtt_stats_message_t *msg) {
+    // Get current timestamp
+    format_iso8601_timestamp(msg->timestamp, sizeof(msg->timestamp));
+    
+    // Query Statistics Task for period data
+    period_statistics_t *period_stats = statistics_get_period();
+    
+    msg->period_duration = period_stats->period_duration_sec;
+    
+    // RTCM metrics
+    msg->rtcm_bytes_received = period_stats->rtcm_bytes_received;
+    msg->rtcm_message_rate = period_stats->rtcm_message_rate;
+    msg->rtcm_data_gaps = period_stats->rtcm_data_gaps;
+    
+    // GNSS metrics
+    memcpy(msg->fix_quality_duration, period_stats->fix_quality_duration, sizeof(msg->fix_quality_duration));
+    msg->rtk_fixed_percent = period_stats->rtk_fixed_stability_percent;
+    msg->hdop_avg = period_stats->hdop_avg;
+    msg->sats_avg = period_stats->satellites_avg;
+    
+    // WiFi metrics
+    msg->wifi_rssi_avg = period_stats->wifi_rssi_avg;
+    msg->wifi_uptime_percent = period_stats->wifi_uptime_percent;
+    
+    // Error metrics
+    msg->nmea_errors = period_stats->nmea_checksum_errors;
+    msg->uart_errors = period_stats->uart_errors;
+    msg->rtcm_queue_overflows = period_stats->rtcm_queue_overflows;
+}
+```
+
+### Implementation Notes:
+- Task priority: 2 (same as LED Indicator, lower than critical communication tasks)
+- Stack size: 5120 bytes (increased for larger JSON buffers for status/stats messages)
+- Use ESP-IDF `esp_mqtt_client` component for MQTT connectivity
+- **No NMEA parsing in this task** - all data pre-parsed by GNSS Receiver Task
+- **Three independent publish intervals** managed with separate counters
+- Simple data mapping from centralized structures to JSON messages
+- Status message provides cumulative runtime view (system health snapshot)
+- Stats message provides detailed period metrics (performance analysis)
+- GNSS message provides real-time position tracking
+- All three topics use same base topic with different suffixes
+- Message counter only applies to GNSS messages (position tracking)
+- Consider adding last will and testament (LWT) for connection monitoring
+- Optional: Add command subscription for remote configuration updates (`<base>/cmd`)
+
+### Configuration Example:
+
+```c
+mqtt_config_t mqtt_config = {
+    .broker = "mqtt.example.com",
+    .port = 1883,
+    .topic = "ntripclient",          // Base topic
+    .user = "mqtt_user",
+    .password = "mqtt_password",
+    .gnss_interval_sec = 10,         // GNSS position every 10 seconds
+    .status_interval_sec = 120,      // System status every 120 seconds
+    .stats_interval_sec = 60,        // Statistics every 60 seconds
+    .enabled = true
+};
+```
+
+**Published Topics**:
+- `ntripclient/GNSS` - Position data every 10 seconds
+- `ntripclient/status` - Cumulative system status every 120 seconds
+- `ntripclient/stats` - Period statistics every 60 seconds
+
+### Published Topics Summary:
+
+| Topic | Content | Interval | Purpose |
+|-------|---------|----------|---------|
+| `<base>/GNSS` | Position data (JSON) | 10s (configurable) | Real-time location tracking |
+| `<base>/status` | System status (JSON) | 120s (configurable) | Cumulative runtime health snapshot |
+| `<base>/stats` | Statistics (JSON) | 60s (configurable) | Period performance metrics |
+
+### Optional Future Topics:
+
+| Topic | Content | Purpose |
+|-------|---------|---------|  
+| `<base>/events` | Critical events (text/JSON) | Fix quality changes, errors, alerts |
+| `<base>/cmd` | Command input (subscribe) | Remote configuration and control |
+
+---
+
 ### Communication:
  - FreeRTOS queues for inter-task data passing
  - Event groups for status synchronization
  - Mutexes for configuration access protection
  - **rtcm_queue**: NTRIP Client → GPS Receiver (RTCM corrections)
  - **gga_queue**: GPS Receiver → NTRIP Client (GGA position)
- - **gnss_data**: Shared structure with mutex (GPS Receiver → Data Output)
+ - **gnss_data**: Shared structure with mutex (GPS Receiver → Data Output, MQTT Client)
 
 ### UART Pin Assignment Summary:
 

@@ -43,6 +43,9 @@ static const app_config_t default_config = {
         .topic = "ntripclient",
         .user = "mqttuser",
         .password = "mqttpassword",
+        .gnss_interval_sec = 10,
+        .status_interval_sec = 120,
+        .stats_interval_sec = 60,
         .enabled = false  // Disabled by default until configured
     }
 };
@@ -212,6 +215,10 @@ static esp_err_t nvs_load_mqtt(mqtt_config_t* config) {
     size = sizeof(config->password);
     nvs_get_str(handle, "password", config->password, &size);
 
+    nvs_get_u16(handle, "gnss_interval", &config->gnss_interval_sec);
+    nvs_get_u16(handle, "status_interval", &config->status_interval_sec);
+    nvs_get_u16(handle, "stats_interval", &config->stats_interval_sec);
+
     uint8_t enabled;
     if (nvs_get_u8(handle, "enabled", &enabled) == ESP_OK) {
         config->enabled = (enabled != 0);
@@ -240,6 +247,9 @@ static esp_err_t nvs_save_mqtt(const mqtt_config_t* config) {
     nvs_set_str(handle, "topic", config->topic);
     nvs_set_str(handle, "user", config->user);
     nvs_set_str(handle, "password", config->password);
+    nvs_set_u16(handle, "gnss_interval", config->gnss_interval_sec);
+    nvs_set_u16(handle, "status_interval", config->status_interval_sec);
+    nvs_set_u16(handle, "stats_interval", config->stats_interval_sec);
     nvs_set_u8(handle, "enabled", config->enabled ? 1 : 0);
 
     err = nvs_commit(handle);
@@ -429,6 +439,27 @@ esp_err_t config_set_ntrip(const ntrip_config_t* config) {
     return ESP_ERR_TIMEOUT;
 }
 
+esp_err_t config_set_ntrip_enabled_runtime(bool enabled) {
+    if (config_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        app_config.ntrip.enabled = enabled;
+        xSemaphoreGive(config_mutex);
+
+        if (config_event_group != NULL) {
+            xEventGroupSetBits(config_event_group, CONFIG_NTRIP_CHANGED_BIT);
+        }
+
+        ESP_LOGI(TAG, "NTRIP runtime enabled set to %s (no NVS write)", enabled ? "true" : "false");
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG, "Failed to acquire mutex for NTRIP runtime enable");
+    return ESP_ERR_TIMEOUT;
+}
+
 esp_err_t config_set_mqtt(const mqtt_config_t* config) {
     if (config == NULL || config_mutex == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -458,6 +489,27 @@ esp_err_t config_set_mqtt(const mqtt_config_t* config) {
     }
 
     ESP_LOGE(TAG, "Failed to acquire mutex for MQTT config write");
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t config_set_mqtt_enabled_runtime(bool enabled) {
+    if (config_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        app_config.mqtt.enabled = enabled;
+        xSemaphoreGive(config_mutex);
+
+        if (config_event_group != NULL) {
+            xEventGroupSetBits(config_event_group, CONFIG_MQTT_CHANGED_BIT);
+        }
+
+        ESP_LOGI(TAG, "MQTT runtime enabled set to %s (no NVS write)", enabled ? "true" : "false");
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG, "Failed to acquire mutex for MQTT runtime enable");
     return ESP_ERR_TIMEOUT;
 }
 

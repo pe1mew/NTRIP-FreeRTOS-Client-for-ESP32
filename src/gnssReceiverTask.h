@@ -41,6 +41,7 @@ typedef struct {
     uint8_t fix_quality; // 0=no fix, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK float
     uint8_t satellites;  // Number of satellites
     float hdop;          // Horizontal dilution of precision
+    volatile float dgps_age;      // Age of differential GPS data (seconds, GGA field 13)
     
     // Status
     time_t timestamp;   // Last update time

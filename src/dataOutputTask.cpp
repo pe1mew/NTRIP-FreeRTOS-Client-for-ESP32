@@ -8,8 +8,8 @@
  * Protocol Format:
  * [SOH] [Message Data (stuffed)] [CRC-16 High (stuffed)] [CRC-16 Low (stuffed)] [CAN]
  * 
- * Message Format: DATE,TIME,LAT,LON,ALT,HEADING,SPEED
- * Example: 100126,143052.123,-34.123456,150.987654,123.45,270.15,45.67
+ * Message Format: YYYY-MM-DD HH:mm:ss.sss,LAT,LON,ALT,HEADING,SPEED
+ * Example: 2026-01-10 14:30:52.123,-34.123456,150.987654,123.45,270.15,45.67
  */
 
 #include "dataOutputTask.h"
@@ -66,11 +66,11 @@ static size_t build_telemetry_frame(const position_data_t* pos, uint8_t* frame, 
         return 0;
     }
 
-    // Format message string: DATE,TIME,LAT,LON,ALT,HEADING,SPEED
+    // Format message string: YYYY-MM-DD HH:mm:ss.sss,LAT,LON,ALT,HEADING,SPEED
     char message[128];
     int msg_len = snprintf(message, sizeof(message),
-                          "%02d%02d%02d,%02d%02d%02d.%03d,%.6f,%.6f,%.2f,%.2f,%.2f",
-                          pos->day, pos->month, pos->year,
+                          "%04d-%02d-%02d %02d:%02d:%02d.%03d,%.6f,%.6f,%.2f,%.2f,%.2f",
+                          2000 + pos->year, pos->month, pos->day,
                           pos->hour, pos->minute, pos->second, pos->millisecond,
                           pos->latitude, pos->longitude,
                           pos->altitude, pos->heading, pos->speed);

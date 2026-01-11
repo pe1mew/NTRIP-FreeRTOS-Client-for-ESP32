@@ -3,6 +3,7 @@
 #include "wifiManager.h"
 #include "ntripClientTask.h"
 #include "gnssReceiverTask.h"
+#include "mqttClientTask.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <driver/gpio.h>
@@ -233,8 +234,8 @@ static void led_indicator_task(void *pvParameters) {
         status.ntrip_data_activity = (now - status.last_ntrip_data_time) < ACTIVITY_TIMEOUT_SEC;
         status.mqtt_activity = (now - status.last_mqtt_activity_time) < ACTIVITY_TIMEOUT_SEC;
         
-        // MQTT connection status (placeholder - implement when MQTT task is ready)
-        status.mqtt_connected = false;
+        // MQTT connection status
+        status.mqtt_connected = mqtt_is_connected();
         
         // Update discrete LEDs
         gpio_set_level(WIFI_LED, status.wifi_sta_connected ? 1 : 0);

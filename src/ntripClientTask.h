@@ -59,6 +59,26 @@ esp_err_t ntrip_client_task_init(void);
 bool ntrip_client_is_connected(void);
 
 /**
+ * @brief Get NTRIP client connection status - Compatibility wrapper
+ * 
+ * Same as ntrip_client_is_connected, provided for naming consistency
+ * 
+ * @return true if connected to NTRIP caster, false otherwise
+ */
+static inline bool ntrip_is_connected(void) {
+    return ntrip_client_is_connected();
+}
+
+/**
+ * @brief Get NTRIP client uptime in seconds
+ * 
+ * Returns the cumulative time the NTRIP client has been connected
+ * 
+ * @return Total connection time in seconds
+ */
+uint32_t ntrip_get_uptime_sec(void);
+
+/**
  * @brief Stop NTRIP client task and cleanup resources
  * 
  * Disconnects from NTRIP caster, deletes queues, and stops the task.

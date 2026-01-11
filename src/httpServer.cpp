@@ -18,7 +18,7 @@ static const char* html_page =
 "<head>\n"
 "    <meta charset='utf-8'>\n"
 "    <meta name='viewport' content='width=device-width, initial-scale=1'>\n"
-"    <title>ESP32 Configuration</title>\n"
+"    <title>NTRIP-client Configuration</title>\n"
 "    <style>\n"
 "        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }\n"
 "        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }\n"
@@ -120,6 +120,18 @@ static const char* html_page =
 "            <label>Password:</label>\n"
 "            <input type='password' id='mqtt_password' maxlength='63' placeholder='Leave blank to keep current password'>\n"
 "        </div>\n"
+"        <div class='form-group'>\n"
+"            <label>GNSS Interval (sec, 0=disabled):</label>\n"
+"            <input type='number' id='mqtt_gnss_interval' min='0' max='300' value='10'>\n"
+"        </div>\n"
+"        <div class='form-group'>\n"
+"            <label>Status Interval (sec, 0=disabled):</label>\n"
+"            <input type='number' id='mqtt_status_interval' min='0' max='600' value='120'>\n"
+"        </div>\n"
+"        <div class='form-group'>\n"
+"            <label>Stats Interval (sec, 0=disabled):</label>\n"
+"            <input type='number' id='mqtt_stats_interval' min='0' max='600' value='60'>\n"
+"        </div>\n"
 "        <div style='margin-top: 30px;'>\n"
 "            <button onclick='saveConfig()'>Save Configuration</button>\n"
 "            <button onclick='restartDevice()'>Restart Device</button>\n"
@@ -142,6 +154,9 @@ static const char* html_page =
 "                document.getElementById('mqtt_port').value = data.mqtt.port;\n"
 "                document.getElementById('mqtt_topic').value = data.mqtt.topic;\n"
 "                document.getElementById('mqtt_user').value = data.mqtt.user;\n"
+"                document.getElementById('mqtt_gnss_interval').value = data.mqtt.gnss_interval_sec;\n"
+"                document.getElementById('mqtt_status_interval').value = data.mqtt.status_interval_sec;\n"
+"                document.getElementById('mqtt_stats_interval').value = data.mqtt.stats_interval_sec;\n"
 "            }).catch(e => showStatus('Failed to load configuration', 'error'));\n"
 "        }\n"
 "        function saveConfig() {\n"
@@ -153,7 +168,10 @@ static const char* html_page =
 "                         gga_interval_sec: parseInt(document.getElementById('ntrip_gga_interval').value), reconnect_delay_sec: 5 },\n"
 "                mqtt: { enabled: document.getElementById('mqtt_enabled').checked, broker: document.getElementById('mqtt_broker').value,\n"
 "                        port: parseInt(document.getElementById('mqtt_port').value), topic: document.getElementById('mqtt_topic').value,\n"
-"                        user: document.getElementById('mqtt_user').value, password: document.getElementById('mqtt_password').value }\n"
+"                        user: document.getElementById('mqtt_user').value, password: document.getElementById('mqtt_password').value,\n"
+"                        gnss_interval_sec: parseInt(document.getElementById('mqtt_gnss_interval').value),\n"
+"                        status_interval_sec: parseInt(document.getElementById('mqtt_status_interval').value),\n"
+"                        stats_interval_sec: parseInt(document.getElementById('mqtt_stats_interval').value) }\n"
 "            };\n"
 "            fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) })\n"
 "            .then(r => r.json()).then(data => showStatus(data.message, data.status === 'ok' ? 'success' : 'error'))\n"
@@ -251,6 +269,9 @@ static esp_err_t api_config_get_handler(httpd_req_t *req) {
     cJSON_AddStringToObject(mqtt, "topic", config.mqtt.topic);
     cJSON_AddStringToObject(mqtt, "user", config.mqtt.user);
     cJSON_AddStringToObject(mqtt, "password", "********");
+    cJSON_AddNumberToObject(mqtt, "gnss_interval_sec", config.mqtt.gnss_interval_sec);
+    cJSON_AddNumberToObject(mqtt, "status_interval_sec", config.mqtt.status_interval_sec);
+    cJSON_AddNumberToObject(mqtt, "stats_interval_sec", config.mqtt.stats_interval_sec);
     cJSON_AddBoolToObject(mqtt, "enabled", config.mqtt.enabled);
     cJSON_AddItemToObject(root, "mqtt", mqtt);
     
@@ -354,6 +375,9 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
         cJSON *topic = cJSON_GetObjectItem(mqtt, "topic");
         cJSON *user = cJSON_GetObjectItem(mqtt, "user");
         cJSON *password = cJSON_GetObjectItem(mqtt, "password");
+        cJSON *gnss_interval = cJSON_GetObjectItem(mqtt, "gnss_interval_sec");
+        cJSON *status_interval = cJSON_GetObjectItem(mqtt, "status_interval_sec");
+        cJSON *stats_interval = cJSON_GetObjectItem(mqtt, "stats_interval_sec");
         
         if (enabled && cJSON_IsBool(enabled)) { config.mqtt.enabled = cJSON_IsTrue(enabled); mqtt_changed = true; }
         if (broker && cJSON_IsString(broker)) { strncpy(config.mqtt.broker, broker->valuestring, sizeof(config.mqtt.broker) - 1); mqtt_changed = true; }
@@ -365,6 +389,9 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
             strncpy(config.mqtt.password, password->valuestring, sizeof(config.mqtt.password) - 1);
             mqtt_changed = true;
         }
+        if (gnss_interval && cJSON_IsNumber(gnss_interval)) { config.mqtt.gnss_interval_sec = gnss_interval->valueint; mqtt_changed = true; }
+        if (status_interval && cJSON_IsNumber(status_interval)) { config.mqtt.status_interval_sec = status_interval->valueint; mqtt_changed = true; }
+        if (stats_interval && cJSON_IsNumber(stats_interval)) { config.mqtt.stats_interval_sec = stats_interval->valueint; mqtt_changed = true; }
     }
     
     cJSON_Delete(root);
@@ -475,22 +502,14 @@ static esp_err_t api_toggle_post_handler(httpd_req_t *req) {
     const char *service = service_item->valuestring;
     bool enabled = cJSON_IsTrue(enabled_item);
     
-    // Get current config
-    app_config_t config;
-    if (config_get_all(&config) != ESP_OK) {
-        cJSON_Delete(root);
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Failed to read configuration\"}");
-        return ESP_FAIL;
-    }
-    
-    // Update the specific service
+    // Update the specific service runtime-only (no NVS write) for instant effect
+    esp_err_t err = ESP_OK;
     if (strcmp(service, "ntrip") == 0) {
-        config.ntrip.enabled = enabled;
-        ESP_LOGI(TAG, "NTRIP service %s via web interface", enabled ? "enabled" : "disabled");
+        err = config_set_ntrip_enabled_runtime(enabled);
+        ESP_LOGI(TAG, "NTRIP service %s via web interface (runtime apply)", enabled ? "enabled" : "disabled");
     } else if (strcmp(service, "mqtt") == 0) {
-        config.mqtt.enabled = enabled;
-        ESP_LOGI(TAG, "MQTT service %s via web interface", enabled ? "enabled" : "disabled");
+        err = config_set_mqtt_enabled_runtime(enabled);
+        ESP_LOGI(TAG, "MQTT service %s via web interface (runtime apply)", enabled ? "enabled" : "disabled");
     } else {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "400 Bad Request");
@@ -500,10 +519,9 @@ static esp_err_t api_toggle_post_handler(httpd_req_t *req) {
     
     cJSON_Delete(root);
     
-    // Save configuration
-    if (config_set_all(&config) != ESP_OK) {
+    if (err != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
-        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Failed to save configuration\"}");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Failed to apply toggle\"}");
         return ESP_FAIL;
     }
     

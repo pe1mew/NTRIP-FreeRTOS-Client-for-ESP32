@@ -10,6 +10,8 @@
 #include "gnssReceiverTask.h"
 #include "ledIndicatorTask.h"
 #include "dataOutputTask.h"
+#include "statisticsTask.h"
+#include "mqttClientTask.h"
 
 static const char *TAG = "MAIN";
 
@@ -94,6 +96,22 @@ extern "C" void app_main(void) {
     // ========================================
     led_indicator_task_init();
     ESP_LOGI(TAG, "✓ LED Indicator Task initialized");
+    
+    // ========================================
+    // Step 9: Initialize Statistics Task
+    // ========================================
+    statistics_task_init();
+    ESP_LOGI(TAG, "✓ Statistics Task initialized");
+    
+    // ========================================
+    // Step 10: Initialize MQTT Client Task
+    // ========================================
+    ret = mqtt_client_task_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "MQTT Client Task initialization failed or disabled: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "✓ MQTT Client Task initialized");
+    }
     
     // ========================================
     // System Ready

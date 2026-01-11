@@ -10,6 +10,7 @@
 #include <driver/uart.h>
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -114,6 +115,7 @@ static void update_gnss_data(const char *sentence) {
             gnss_data.fix_quality = (uint8_t)gga.fixType;
             gnss_data.satellites = (uint8_t)gga.satellites;
             gnss_data.hdop = (float)gga.hdop;
+            gnss_data.dgps_age = (float)gga.ageOfDifferentialData;
             
             // Parse time from GGA (HHMMSS.sss format)
             if (strlen(gga.timeBuffer) >= 6) {
@@ -381,6 +383,9 @@ void gnss_get_data(gnss_data_t *data) {
     if (data == NULL) {
         return;
     }
+    
+    // Initialize to prevent returning garbage if mutex fails
+    memset(data, 0, sizeof(gnss_data_t));
     
     if (xSemaphoreTake(gnss_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         memcpy(data, &gnss_data, sizeof(gnss_data_t));
