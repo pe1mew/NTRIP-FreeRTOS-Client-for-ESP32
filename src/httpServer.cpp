@@ -58,15 +58,29 @@ static const char* html_page =
 "    <div class='container'>\n"
 "        <h1>NTRIP-client Configuration</h1>\n"
 "        <div id='status'></div>\n"
-"        <h2>GNSS status</h2>\n"
-"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
-"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>GNSS status:</span>\n"
+"        <h2>GNSS receiver</h2>\n"
+"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 8px;'>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>Status:</span>\n"
 "            <span id='gnss_status_indicator' class='status-indicator disconnected' title='Valid NMEA'></span>\n"
 "            <span style='color:#555; font-size:15px; margin-left:18px;'>Satellites: <span id='gnss_sat_count'>0</span></span>\n"
 "        </div>\n"
+"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:10px;'>Position quality:</span>\n"
+"            <span id='gnss_signal_bar' style='display: flex; align-items: center;'>\n"
+"                <span class='gnss-bar-box' id='gnss-bar-1'></span>\n"
+"                <span class='gnss-bar-box' id='gnss-bar-2'></span>\n"
+"                <span class='gnss-bar-box' id='gnss-bar-3'></span>\n"
+"                <span class='gnss-bar-box' id='gnss-bar-4'></span>\n"
+"            </span>\n"
+"            <span id='gnss_quality_text' style='color:#0066cc; font-size:14px; margin-left:14px;'></span>\n"
+"        </div>\n"
+"        <style>\n"
+"        .gnss-bar-box { width: 18px; height: 18px; border: 2px solid #0066cc; margin-right: 3px; display: inline-block; border-radius: 3px; background: #fff; transition: background 0.2s, border-color 0.2s; }\n"
+"        .gnss-bar-box.filled { background: #0066cc; border-color: #0066cc; }\n"
+"        </style>\n"
 "        <h2>WiFi Configuration</h2>\n"
 "        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
-"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>WiFi status:</span>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>Status:</span>\n"
 "            <span id='wifi_status_indicator' class='status-indicator disconnected' title='WiFi status'></span>\n"
 "            <span style='color:#555; font-size:15px; margin-left:18px;'>STA IP: <span id='sta_ip_display'>Checking...</span></span>\n"
 "        </div>\n"
@@ -87,15 +101,13 @@ static const char* html_page =
 "            <input type='password' id='ap_password' maxlength='63' placeholder='Leave blank to keep current password'>\n"
 "        </div>\n"
 "        <h2 style='margin-bottom: 8px;'>NTRIP Configuration</h2>\n"
-"        <div class='switch-container'>\n"
-"            <label>Enable NTRIP Client:</label>\n"
+"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
+"            <span style='font-weight:bold; color:#555; margin-right:10px;'>Enable:</span>\n"
 "            <label class='switch'>\n"
 "                <input type='checkbox' id='ntrip_enabled' onchange='toggleService(\"ntrip\", this.checked)'>\n"
 "                <span class='slider'></span>\n"
 "            </label>\n"
-"        </div>\n"
-"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
-"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>Connection status:</span>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-left:18px; margin-right:6px;'>Status:</span>\n"
 "            <span id='ntrip_status_indicator' class='status-indicator disconnected' title='NTRIP status'></span>\n"
 "        </div>\n"
 "        <div class='form-group'>\n"
@@ -123,15 +135,13 @@ static const char* html_page =
 "            <input type='number' id='ntrip_gga_interval' min='10' max='600' value='120'>\n"
 "        </div>\n"
 "        <h2 style='margin-bottom: 8px;'>MQTT Configuration</h2>\n"
-"        <div class='switch-container'>\n"
-"            <label>Enable MQTT Client:</label>\n"
+"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
+"            <span style='font-weight:bold; color:#555; margin-right:10px;'>Enable:</span>\n"
 "            <label class='switch'>\n"
 "                <input type='checkbox' id='mqtt_enabled' onchange='toggleService(\"mqtt\", this.checked)'>\n"
 "                <span class='slider'></span>\n"
 "            </label>\n"
-"        </div>\n"
-"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
-"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>Connection status:</span>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-left:18px; margin-right:6px;'>Status:</span>\n"
 "            <span id='mqtt_status_indicator' class='status-indicator disconnected' title='MQTT status'></span>\n"
 "        </div>\n"
 "        <div class='form-group'>\n"
@@ -195,6 +205,11 @@ static const char* html_page =
 "            }).catch(e => showStatus('Failed to load configuration', 'error'));\n"
 "        }\n"
 "        function saveConfig() {\n"
+"            const topic = document.getElementById('mqtt_topic').value;\n"
+"            if (topic.length === 0 || topic.startsWith('/') || topic.endsWith('/')) {\n"
+"                showStatus('MQTT topic must not start or end with a slash.', 'error');\n"
+"                return;\n"
+"            }\n"
 "            const config = {\n"
 "                wifi: { ssid: document.getElementById('wifi_ssid').value, password: document.getElementById('wifi_password').value, ap_password: document.getElementById('ap_password').value },\n"
 "                ntrip: { enabled: document.getElementById('ntrip_enabled').checked, host: document.getElementById('ntrip_host').value,\n"
@@ -202,7 +217,7 @@ static const char* html_page =
 "                         user: document.getElementById('ntrip_user').value, password: document.getElementById('ntrip_password').value,\n"
 "                         gga_interval_sec: parseInt(document.getElementById('ntrip_gga_interval').value), reconnect_delay_sec: 5 },\n"
 "                mqtt: { enabled: document.getElementById('mqtt_enabled').checked, broker: document.getElementById('mqtt_broker').value,\n"
-"                        port: parseInt(document.getElementById('mqtt_port').value), topic: document.getElementById('mqtt_topic').value,\n"
+"                        port: parseInt(document.getElementById('mqtt_port').value), topic: topic,\n"
 "                        user: document.getElementById('mqtt_user').value, password: document.getElementById('mqtt_password').value,\n"
 "                        gnss_interval_sec: parseInt(document.getElementById('mqtt_gnss_interval').value),\n"
 "                        status_interval_sec: parseInt(document.getElementById('mqtt_status_interval').value),\n"
@@ -256,6 +271,32 @@ static const char* html_page =
 "                    gnssInd.classList.add('disconnected');\n"
 "                }\n"
 "                document.getElementById('gnss_sat_count').textContent = data.gnss_satellites !== undefined ? data.gnss_satellites : '0';\n"
+"                // GNSS signal bar\n"
+"                var fix = data.gnss_fix_quality !== undefined ? data.gnss_fix_quality : 0;\n"
+"                for (var i = 1; i <= 4; ++i) {\n"
+"                    var box = document.getElementById('gnss-bar-' + i);\n"
+"                    box.classList.remove('filled');\n"
+"                }\n"
+"                var qualityText = '';\n"
+"                if (gnss) {\n"
+"                    if (fix === 4) {\n"
+"                        for (var i = 1; i <= 4; ++i) document.getElementById('gnss-bar-' + i).classList.add('filled');\n"
+"                        qualityText = 'RTK FIX: Centimeter-level accuracy';\n"
+"                    } else if (fix === 5) {\n"
+"                        for (var i = 1; i <= 3; ++i) document.getElementById('gnss-bar-' + i).classList.add('filled');\n"
+"                        qualityText = 'RTK FLOAT: Decimeter-level accuracy';\n"
+"                    } else if (fix === 1 || fix === 2) {\n"
+"                        for (var i = 1; i <= 2; ++i) document.getElementById('gnss-bar-' + i).classList.add('filled');\n"
+"                        qualityText = 'GPS FIX: Meter-level accuracy';\n"
+"                    } else {\n"
+"                        document.getElementById('gnss-bar-1').classList.add('filled');\n"
+"                        qualityText = 'Valid NMEA, no fix';\n"
+"                    }\n"
+"                } else {\n"
+"                    document.getElementById('gnss-bar-1').classList.add('filled');\n"
+"                    qualityText = 'No valid NMEA data';\n"
+"                }\n"
+"                document.getElementById('gnss_quality_text').textContent = qualityText;\n"
 "                // WiFi indicator\n"
 "                var wifi = data.wifi.sta_connected !== undefined ? data.wifi.sta_connected : false;\n"
 "                var wifiInd = document.getElementById('wifi_status_indicator');\n"
@@ -464,7 +505,18 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
         if (enabled && cJSON_IsBool(enabled)) { config.mqtt.enabled = cJSON_IsTrue(enabled); mqtt_changed = true; }
         if (broker && cJSON_IsString(broker)) { strncpy(config.mqtt.broker, broker->valuestring, sizeof(config.mqtt.broker) - 1); mqtt_changed = true; }
         if (port && cJSON_IsNumber(port)) { config.mqtt.port = port->valueint; mqtt_changed = true; }
-        if (topic && cJSON_IsString(topic)) { strncpy(config.mqtt.topic, topic->valuestring, sizeof(config.mqtt.topic) - 1); mqtt_changed = true; }
+        if (topic && cJSON_IsString(topic)) {
+            const char *t = topic->valuestring;
+            size_t tlen = strlen(t);
+            if (tlen == 0 || t[0] == '/' || t[tlen-1] == '/') {
+                httpd_resp_set_status(req, "400 Bad Request");
+                httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"MQTT topic must not start or end with a slash.\"}");
+                cJSON_Delete(root);
+                return ESP_FAIL;
+            }
+            strncpy(config.mqtt.topic, t, sizeof(config.mqtt.topic) - 1);
+            mqtt_changed = true;
+        }
         if (user && cJSON_IsString(user)) { strncpy(config.mqtt.user, user->valuestring, sizeof(config.mqtt.user) - 1); mqtt_changed = true; }
         // Only update password if it's not empty
         if (password && cJSON_IsString(password) && strlen(password->valuestring) > 0) {
@@ -553,6 +605,7 @@ static esp_err_t api_status_get_handler(httpd_req_t *req) {
     bool gnss_ok = gnss_has_valid_fix();
     cJSON_AddBoolToObject(root, "gnss_ok", gnss_ok);
     cJSON_AddNumberToObject(root, "gnss_satellites", gnss.satellites);
+    cJSON_AddNumberToObject(root, "gnss_fix_quality", gnss.fix_quality);
 
     char *json_string = cJSON_Print(root);
     httpd_resp_set_type(req, "application/json");
