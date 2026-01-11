@@ -170,7 +170,7 @@ static esp_err_t init_gnss_uart(void) {
 static void gnss_receiver_task(void *pvParameters) {
     char line_buffer[256];
     int line_pos = 0;
-    TickType_t last_gga_time = 0;
+    TickType_t last_gga_time = xTaskGetTickCount() - pdMS_TO_TICKS(DEFAULT_GGA_INTERVAL_SEC * 1000);  // Force immediate send on first valid GGA
     uint16_t gga_interval_sec = DEFAULT_GGA_INTERVAL_SEC;
     
     ESP_LOGI(TAG, "GNSS Receiver Task started");
