@@ -129,35 +129,6 @@ static void update_neopixel(rgb_color_t color) {
     }
 }
 
-// Parse GGA fix quality from GGA sentence
-static uint8_t parse_gga_fix_quality(const char *gga) {
-    if (!gga || gga[0] != '$') {
-        return GPS_FIX_NONE;
-    }
-    
-    // GGA format: $GPGGA,time,lat,N/S,lon,E/W,quality,...
-    // Quality is the 6th field
-    int comma_count = 0;
-    const char *p = gga;
-    
-    while (*p && comma_count < 6) {
-        if (*p == ',') {
-            comma_count++;
-            if (comma_count == 6) {
-                p++;
-                // Parse quality digit
-                if (*p >= '0' && *p <= '9') {
-                    return *p - '0';
-                }
-                break;
-            }
-        }
-        p++;
-    }
-    
-    return GPS_FIX_NONE;
-}
-
 // Calculate NTRIP LED state
 static bool calculate_ntrip_led_state(const led_status_t *status, bool blink_state) {
     if (!status->ntrip_connected) {
@@ -250,7 +221,7 @@ static void led_indicator_task(void *pvParameters) {
         gnss_data_t gnss_data;
         gnss_get_data(&gnss_data);
         status.gps_data_valid = gnss_data.valid;
-        status.gps_fix_quality = parse_gga_fix_quality(gnss_data.gga);
+        status.gps_fix_quality = gnss_data.fix_quality; // Use centrally parsed value
         
         // Check activity timestamps
         struct timeval tv;

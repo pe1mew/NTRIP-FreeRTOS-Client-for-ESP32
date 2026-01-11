@@ -1,0 +1,29 @@
+# Log Level Configuration - Reduced to WARN for flash savings
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2
+
+# Compiler Optimizations
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_DISABLE=y
+
+# Disable Bluetooth (saves ~400KB)
+CONFIG_BT_ENABLED=n
+
+# Disable Core Dump (saves ~20-50KB)
+CONFIG_ESP_COREDUMP_ENABLE=n
+
+# Disable Console Features (saves ~10-20KB)
+CONFIG_ESP_CONSOLE_USB_CDC=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Optimize Wi-Fi (disable unused features)
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
+# CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n  # Cannot disable - needed for AP mode
+
+# Disable unnecessary task watchdog verbosity
+CONFIG_ESP_TASK_WDT_PANIC=n
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# Minimize bootloader log output
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+CONFIG_BOOTLOADER_LOG_LEVEL=2

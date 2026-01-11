@@ -2,9 +2,11 @@
 #include "ntripClientTask.h"
 #include "configurationManagerTask.h"
 #include "hardware_config.h"
+#include "NMEAparser/NMEAParser.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <freertos/event_groups.h>
 #include <driver/uart.h>
 #include <driver/gpio.h>
 #include <esp_log.h>
@@ -25,16 +27,11 @@ static const char *TAG = "GNSSTask";
 // Default GGA interval (seconds)
 #define DEFAULT_GGA_INTERVAL_SEC  120
 
-// Global GNSS data and mutex
-static gnss_data_t gnss_data = {
-    .gga = {0},
-    .rmc = {0},
-    .vtg = {0},
-    .timestamp = 0,
-    .valid = false
-};
+// Global GNSS data, mutex, and event group
+static gnss_data_t gnss_data;
 static SemaphoreHandle_t gnss_data_mutex = NULL;
 static TaskHandle_t gnss_task_handle = NULL;
+EventGroupHandle_t gnss_event_group = NULL;
 
 // Calculate NMEA checksum
 static uint8_t calculate_nmea_checksum(const char *sentence) {
@@ -91,7 +88,7 @@ static bool is_sentence_type(const char *sentence, const char *type) {
     return false;
 }
 
-// Update GNSS data with new sentence
+// Update GNSS data with new sentence using centralized parsing
 static void update_gnss_data(const char *sentence) {
     if (!validate_nmea_sentence(sentence)) {
         ESP_LOGD(TAG, "Invalid NMEA checksum");
@@ -101,26 +98,83 @@ static void update_gnss_data(const char *sentence) {
     if (xSemaphoreTake(gnss_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         struct timeval tv;
         gettimeofday(&tv, NULL);
+        bool data_updated = false;
+        bool gga_updated = false;
         
         if (is_sentence_type(sentence, "GGA")) {
+            // Store raw GGA for NTRIP
             strncpy(gnss_data.gga, sentence, sizeof(gnss_data.gga) - 1);
             gnss_data.gga[sizeof(gnss_data.gga) - 1] = '\0';
+            
+            // Parse GGA using NMEAParser
+            GGAData gga = parseGGASentence(sentence);
+            gnss_data.latitude = gga.latitude;
+            gnss_data.longitude = gga.longitude;
+            gnss_data.altitude = (float)gga.altitude;
+            gnss_data.fix_quality = (uint8_t)gga.fixType;
+            gnss_data.satellites = (uint8_t)gga.satellites;
+            gnss_data.hdop = (float)gga.hdop;
+            
+            // Parse time from GGA (HHMMSS.sss format)
+            if (strlen(gga.timeBuffer) >= 6) {
+                int hhmmss = atoi(gga.timeBuffer);
+                gnss_data.hour = hhmmss / 10000;
+                gnss_data.minute = (hhmmss / 100) % 100;
+                gnss_data.second = hhmmss % 100;
+                float frac = atof(gga.timeBuffer) - hhmmss;
+                gnss_data.millisecond = (uint16_t)(frac * 1000);
+            }
+            
             gnss_data.timestamp = tv.tv_sec;
-            gnss_data.valid = true;
-            ESP_LOGD(TAG, "Updated GGA: %s", gnss_data.gga);
-        } else if (is_sentence_type(sentence, "RMC")) {
+            gnss_data.valid = (gga.fixType > 0);
+            data_updated = true;
+            gga_updated = true;
+            ESP_LOGD(TAG, "Updated GGA: lat=%.6f, lon=%.6f, alt=%.2f, fix=%d",
+                     gnss_data.latitude, gnss_data.longitude, gnss_data.altitude, gnss_data.fix_quality);
+        } 
+        else if (is_sentence_type(sentence, "RMC")) {
+            // Store raw RMC
             strncpy(gnss_data.rmc, sentence, sizeof(gnss_data.rmc) - 1);
             gnss_data.rmc[sizeof(gnss_data.rmc) - 1] = '\0';
-            gnss_data.timestamp = tv.tv_sec;
-            ESP_LOGD(TAG, "Updated RMC: %s", gnss_data.rmc);
-        } else if (is_sentence_type(sentence, "VTG")) {
+            
+            // Parse RMC using NMEAParser
+            RMCData rmc = parseRMCSentence(sentence);
+            if (rmc.valid) {
+                gnss_data.day = (uint8_t)rmc.day;
+                gnss_data.month = (uint8_t)rmc.month;
+                gnss_data.year = (uint8_t)(rmc.year % 100);
+                gnss_data.timestamp = tv.tv_sec;
+                data_updated = true;
+                ESP_LOGD(TAG, "Updated RMC: date=%02d/%02d/%02d",
+                         gnss_data.day, gnss_data.month, gnss_data.year);
+            }
+        } 
+        else if (is_sentence_type(sentence, "VTG")) {
+            // Store raw VTG
             strncpy(gnss_data.vtg, sentence, sizeof(gnss_data.vtg) - 1);
             gnss_data.vtg[sizeof(gnss_data.vtg) - 1] = '\0';
+            
+            // Parse VTG using NMEAParser
+            VTGData vtg = parseVTGSentence(sentence);
+            gnss_data.heading = (float)vtg.direction;
+            gnss_data.speed = (float)(vtg.speed * 3.6); // Convert m/s to km/h
             gnss_data.timestamp = tv.tv_sec;
-            ESP_LOGD(TAG, "Updated VTG: %s", gnss_data.vtg);
+            data_updated = true;
+            ESP_LOGD(TAG, "Updated VTG: heading=%.2f, speed=%.2f km/h",
+                     gnss_data.heading, gnss_data.speed);
         }
         
         xSemaphoreGive(gnss_data_mutex);
+        
+        // Notify waiting tasks of data update
+        if (gnss_event_group != NULL) {
+            if (data_updated) {
+                xEventGroupSetBits(gnss_event_group, GNSS_DATA_UPDATED_BIT);
+            }
+            if (gga_updated) {
+                xEventGroupSetBits(gnss_event_group, GNSS_GGA_UPDATED_BIT);
+            }
+        }
     }
 }
 
@@ -291,6 +345,18 @@ void gnss_receiver_task_init(void) {
             return;
         }
     }
+    
+    // Create event group for GNSS data notifications
+    if (gnss_event_group == NULL) {
+        gnss_event_group = xEventGroupCreate();
+        if (gnss_event_group == NULL) {
+            ESP_LOGE(TAG, "Failed to create GNSS event group");
+            return;
+        }
+    }
+    
+    // Initialize GNSS data structure
+    memset(&gnss_data, 0, sizeof(gnss_data_t));
     
     // Create task
     BaseType_t result = xTaskCreate(

@@ -9,6 +9,7 @@
 #include "ntripClientTask.h"
 #include "gnssReceiverTask.h"
 #include "ledIndicatorTask.h"
+#include "dataOutputTask.h"
 
 static const char *TAG = "MAIN";
 
@@ -79,7 +80,17 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "✓ GNSS Receiver Task initialized");
     
     // ========================================
-    // Step 7: Initialize LED Indicator Task
+    // Step 7: Initialize Data Output Task
+    // ========================================
+    ret = data_output_task_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize Data Output Task: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "✓ Data Output Task initialized");
+    
+    // ========================================
+    // Step 8: Initialize LED Indicator Task
     // ========================================
     led_indicator_task_init();
     ESP_LOGI(TAG, "✓ LED Indicator Task initialized");
