@@ -1,5 +1,7 @@
 #include "httpServer.h"
 #include "configurationManagerTask.h"
+#include "ntripClientTask.h"
+#include "mqttClientTask.h"
 #include "wifiManager.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -33,14 +35,22 @@ static const char* html_page =
 "        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }\n"
 "        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }\n"
 "        .info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; margin-top: 20px; }\n"
-"        .switch-container { display: flex; align-items: center; margin-bottom: 15px; }\n"
+"        .switch-container { display: flex; align-items: center; margin-bottom: 15px; flex-wrap: nowrap; }\n"
 "        .switch-container label { margin-bottom: 0; margin-right: 15px; }\n"
+"        @media (max-width: 600px) {\n"
+"            .switch-container { flex-direction: row; flex-wrap: nowrap; align-items: center; }\n"
+"            .switch, .status-indicator, .switch-container label, .switch-container span { margin-left: 0; margin-right: 10px; }\n"
+"            .status-indicator { margin-top: 0; }\n"
+"        }\n"
 "        .switch { position: relative; display: inline-block; width: 60px; height: 34px; }\n"
 "        .switch input { opacity: 0; width: 0; height: 0; }\n"
-"        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 34px; }\n"
-"        .slider:before { position: absolute; content: ''; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }\n"
+"        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: background 0.4s; border-radius: 34px; }\n"
+"        .slider:before { position: absolute; content: ''; height: 26px; width: 26px; left: 4px; bottom: 4px; background-color: white; transition: transform 0.4s; border-radius: 50%; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }\n"
 "        input:checked + .slider { background-color: #0066cc; }\n"
-"        input:checked + .slider:before { transform: translateX(26px); }\n"
+"        input:checked + .slider:before { transform: translateX(22px); } /* reduced to 22px to keep ball inside on Android Chrome */\n"
+"        .status-indicator { width: 34px; height: 34px; border-radius: 50%; display: inline-block; margin-left: 12px; border: 2px solid #bbb; box-sizing: border-box; vertical-align: middle; transition: background 0.3s; }\n"
+"        .status-indicator.connected { background: #28c940; border-color: #28c940; }\n"
+"        .status-indicator.disconnected { background: #e74c3c; border-color: #e74c3c; }\n"
 "    </style>\n"
 "</head>\n"
 "<body>\n"
@@ -60,13 +70,17 @@ static const char* html_page =
 "            <label>Password:</label>\n"
 "            <input type='password' id='wifi_password' maxlength='63' placeholder='Leave blank to keep current password'>\n"
 "        </div>\n"
-"        <h2>NTRIP Configuration</h2>\n"
+"        <h2 style='margin-bottom: 8px;'>NTRIP Configuration</h2>\n"
 "        <div class='switch-container'>\n"
 "            <label>Enable NTRIP Client:</label>\n"
 "            <label class='switch'>\n"
 "                <input type='checkbox' id='ntrip_enabled' onchange='toggleService(\"ntrip\", this.checked)'>\n"
 "                <span class='slider'></span>\n"
 "            </label>\n"
+"        </div>\n"
+"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>Connection status:</span>\n"
+"            <span id='ntrip_status_indicator' class='status-indicator disconnected' title='NTRIP status'></span>\n"
 "        </div>\n"
 "        <div class='form-group'>\n"
 "            <label>Host:</label>\n"
@@ -92,13 +106,17 @@ static const char* html_page =
 "            <label>GGA Interval (seconds):</label>\n"
 "            <input type='number' id='ntrip_gga_interval' min='10' max='600' value='120'>\n"
 "        </div>\n"
-"        <h2>MQTT Configuration</h2>\n"
+"        <h2 style='margin-bottom: 8px;'>MQTT Configuration</h2>\n"
 "        <div class='switch-container'>\n"
 "            <label>Enable MQTT Client:</label>\n"
 "            <label class='switch'>\n"
 "                <input type='checkbox' id='mqtt_enabled' onchange='toggleService(\"mqtt\", this.checked)'>\n"
 "                <span class='slider'></span>\n"
 "            </label>\n"
+"        </div>\n"
+"        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
+"            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>Connection status:</span>\n"
+"            <span id='mqtt_status_indicator' class='status-indicator disconnected' title='MQTT status'></span>\n"
 "        </div>\n"
 "        <div class='form-group'>\n"
 "            <label>Broker:</label>\n"
@@ -211,6 +229,26 @@ static const char* html_page =
 "        function updateStatus() {\n"
 "            fetch('/api/status').then(r => r.json()).then(data => {\n"
 "                document.getElementById('sta_status').textContent = data.wifi.sta_connected ? data.wifi.sta_ip : 'Not connected';\n"
+"                // NTRIP indicator\n"
+"                var ntrip = data.ntrip_connected !== undefined ? data.ntrip_connected : false;\n"
+"                var ntripInd = document.getElementById('ntrip_status_indicator');\n"
+"                if (ntrip) {\n"
+"                    ntripInd.classList.add('connected');\n"
+"                    ntripInd.classList.remove('disconnected');\n"
+"                } else {\n"
+"                    ntripInd.classList.remove('connected');\n"
+"                    ntripInd.classList.add('disconnected');\n"
+"                }\n"
+"                // MQTT indicator\n"
+"                var mqtt = data.mqtt_connected !== undefined ? data.mqtt_connected : false;\n"
+"                var mqttInd = document.getElementById('mqtt_status_indicator');\n"
+"                if (mqtt) {\n"
+"                    mqttInd.classList.add('connected');\n"
+"                    mqttInd.classList.remove('disconnected');\n"
+"                } else {\n"
+"                    mqttInd.classList.remove('connected');\n"
+"                    mqttInd.classList.add('disconnected');\n"
+"                }\n"
 "            });\n"
 "        }\n"
 "        loadConfig();\n"
@@ -440,9 +478,9 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
 static esp_err_t api_status_get_handler(httpd_req_t *req) {
     wifi_status_t wifi_status;
     wifi_manager_get_status(&wifi_status);
-    
+
     cJSON *root = cJSON_CreateObject();
-    
+
     // WiFi status
     cJSON *wifi = cJSON_CreateObject();
     cJSON_AddBoolToObject(wifi, "ap_enabled", wifi_status.ap_enabled);
@@ -450,20 +488,26 @@ static esp_err_t api_status_get_handler(httpd_req_t *req) {
     cJSON_AddStringToObject(wifi, "sta_ip", wifi_status.sta_ip);
     cJSON_AddNumberToObject(wifi, "rssi", wifi_status.rssi);
     cJSON_AddItemToObject(root, "wifi", wifi);
-    
+
+    // NTRIP and MQTT status (live flags)
+    extern bool ntrip_client_is_connected(void);
+    extern bool mqtt_is_connected(void);
+    cJSON_AddBoolToObject(root, "ntrip_connected", ntrip_client_is_connected());
+    cJSON_AddBoolToObject(root, "mqtt_connected", mqtt_is_connected());
+
     // System status
     cJSON *system = cJSON_CreateObject();
     cJSON_AddNumberToObject(system, "uptime_sec", esp_timer_get_time() / 1000000);
     cJSON_AddNumberToObject(system, "free_heap", esp_get_free_heap_size());
     cJSON_AddItemToObject(root, "system", system);
-    
+
     char *json_string = cJSON_Print(root);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json_string);
-    
+
     free(json_string);
     cJSON_Delete(root);
-    
+
     return ESP_OK;
 }
 
