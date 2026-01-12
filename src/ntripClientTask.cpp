@@ -13,7 +13,6 @@
 #include "ntripClientTask.h"
 #include "NTRIPclient/NTRIPClient.h"
 #include "configurationManagerTask.h"
-#include "ledIndicatorTask.h"
 #include "wifiManager.h"
 #include "statisticsTask.h"
 #include "esp_log.h"

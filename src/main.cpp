@@ -8,7 +8,6 @@
 #include "httpServer.h"
 #include "ntripClientTask.h"
 #include "gnssReceiverTask.h"
-#include "ledIndicatorTask.h"
 #include "dataOutputTask.h"
 #include "statisticsTask.h"
 #include "mqttClientTask.h"
