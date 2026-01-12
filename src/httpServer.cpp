@@ -14,7 +14,48 @@ static const char* TAG = "HTTPServer";
 static httpd_handle_t server = NULL;
 #include "gnssReceiverTask.h"
 
+// Simple session token (static for now)
+static const char* SESSION_TOKEN = "esp_session_token_123";
+
 // HTML content for main configuration page
+/**
+ * @brief Handler for POST /api/login
+ *        Expects JSON: { "password": "..." }
+ *        Returns: { "status": "ok", "token": "..." } or { "status": "error", "message": "..." }
+ */
+static esp_err_t api_login_post_handler(httpd_req_t *req) {
+    char content[128];
+    int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+    if (ret <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"No data received\"}");
+        return ESP_FAIL;
+    }
+    content[ret] = '\0';
+    cJSON *root = cJSON_Parse(content);
+    if (!root) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
+        return ESP_FAIL;
+    }
+    cJSON *pw_item = cJSON_GetObjectItem(root, "password");
+    if (!pw_item || !cJSON_IsString(pw_item)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Missing password field\"}");
+        return ESP_FAIL;
+    }
+    const char* password = pw_item->valuestring;
+    bool ok = config_test_ui_password(password);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    if (ok) {
+        httpd_resp_sendstr(req, "{\"status\":\"ok\",\"token\":\"esp_session_token_123\"}");
+    } else {
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Invalid password\"}");
+    }
+    return ESP_OK;
+}
 static const char* html_page = 
 "<!DOCTYPE html>\n"
 "<html>\n"
@@ -60,7 +101,16 @@ static const char* html_page =
 "            <b>Connection to the ESP server is lost.</b><br>Please check your network.\n"
 "        </div>\n"
 "    </div>\n"
-"    <div class='container'>\n"
+"    <div id='login-container' class='container' style='max-width:400px;display:none;'>\n"
+"        <h1>Login</h1>\n"
+"        <div id='login-status'></div>\n"
+"        <div class='form-group'>\n"
+"            <label for='login-password'>UI Password:</label>\n"
+"            <input type='password' id='login-password' maxlength='63'>\n"
+"        </div>\n"
+"        <button onclick='login()'>Login</button>\n"
+"    </div>\n"
+"    <div id='main-container' class='container' style='display:none;'>\n"
 "        <h1>NTRIP-client Configuration</h1>\n"
 "        <div id='status'></div>\n"
 "        <h2>GNSS receiver</h2>\n"
@@ -208,8 +258,55 @@ static const char* html_page =
 "        <!-- END MadeByESE SVG -->\n"
 "    </div>\n"
 "    <script>\n"
+"        // --- Authentication logic ---\n"
+"        function showLogin() {\n"
+"            document.getElementById('login-container').style.display = 'block';\n"
+"            document.getElementById('main-container').style.display = 'none';\n"
+"        }\n"
+"        function showMain() {\n"
+"            document.getElementById('login-container').style.display = 'none';\n"
+"            document.getElementById('main-container').style.display = 'block';\n"
+"        }\n"
+"        function login() {\n"
+"            const pw = document.getElementById('login-password').value;\n"
+"            fetch('/api/login', {\n"
+"                method: 'POST',\n"
+"                headers: {'Content-Type': 'application/json'},\n"
+"                body: JSON.stringify({password: pw})\n"
+"            })\n"
+"            .then(r => r.json())\n"
+"            .then(data => {\n"
+"                if (data.status === 'ok') {\n"
+"                    localStorage.setItem('session_token', data.token);\n"
+"                    showMain();\n"
+"                    loadConfig();\n"
+"                    updateStatus();\n"
+"                } else {\n"
+"                    showLoginStatus(data.message || 'Login failed', 'error');\n"
+"                }\n"
+"            })\n"
+"            .catch(e => showLoginStatus('Login failed', 'error'));\n"
+"        }\n"
+"        function showLoginStatus(msg, type) {\n"
+"            const div = document.getElementById('login-status');\n"
+"            div.className = 'status ' + type;\n"
+"            div.textContent = msg;\n"
+"            setTimeout(() => div.textContent = '', 4000);\n"
+"        }\n"
+"        function logout() {\n"
+"            localStorage.removeItem('session_token');\n"
+"            showLogin();\n"
+"        }\n"
+"        function getAuthHeaders() {\n"
+"            const token = localStorage.getItem('session_token');\n"
+"            return token ? { 'Authorization': 'Bearer ' + token } : {};\n"
+"        }\n"
+"        // --- Existing functions ---\n"
 "        function loadConfig() {\n"
-"            fetch('/api/config').then(r => r.json()).then(data => {\n"
+"            fetch('/api/config', { headers: getAuthHeaders() }).then(r => {\n"
+"                if (r.status === 401) { logout(); return Promise.reject('Unauthorized'); }\n"
+"                return r.json();\n"
+"            }).then(data => {\n"
 "                document.getElementById('ui_password').value = '';\n"
 "                // Show/hide UI password warning\n"
 "                if (data.ui && data.ui.password_is_default) {\n"
@@ -256,18 +353,19 @@ static const char* html_page =
 "                        status_interval_sec: parseInt(document.getElementById('mqtt_status_interval').value),\n"
 "                        stats_interval_sec: parseInt(document.getElementById('mqtt_stats_interval').value) }\n"
 "            };\n"
-"            fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(config) })\n"
-"            .then(r => r.json()).then(data => showStatus(data.message, data.status === 'ok' ? 'success' : 'error'))\n"
+"            fetch('/api/config', { method: 'POST', headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()), body: JSON.stringify(config) })\n"
+"            .then(r => { if (r.status === 401) { logout(); return Promise.reject('Unauthorized'); } return r.json(); })\n"
+"            .then(data => showStatus(data.message, data.status === 'ok' ? 'success' : 'error'))\n"
 "            .catch(e => showStatus('Failed to save configuration', 'error'));\n"
 "        }\n"
 "        function restartDevice() {\n"
 "            if(confirm('Restart device?')) {\n"
-"                fetch('/api/restart', {method: 'POST'}).then(() => showStatus('Device restarting...', 'success'));\n"
+"                fetch('/api/restart', {method: 'POST', headers: getAuthHeaders()}).then(r => { if (r.status === 401) { logout(); return Promise.reject('Unauthorized'); } return r.json(); }).then(() => showStatus('Device restarting...', 'success'));\n"
 "            }\n"
 "        }\n"
 "        function factoryReset() {\n"
 "            if(confirm('Reset all settings to factory defaults?')) {\n"
-"                fetch('/api/factory_reset', {method: 'POST'}).then(() => showStatus('Factory reset complete, device restarting...', 'success'));\n"
+"                fetch('/api/factory_reset', {method: 'POST', headers: getAuthHeaders()}).then(r => { if (r.status === 401) { logout(); return Promise.reject('Unauthorized'); } return r.json(); }).then(() => showStatus('Factory reset complete, device restarting...', 'success'));\n"
 "            }\n"
 "        }\n"
 "        function showStatus(msg, type) {\n"
@@ -278,8 +376,9 @@ static const char* html_page =
 "        }\n"
 "        function toggleService(service, enabled) {\n"
 "            const payload = { service: service, enabled: enabled };\n"
-"            fetch('/api/toggle', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) })\n"
-"            .then(r => r.json()).then(data => {\n"
+"            fetch('/api/toggle', { method: 'POST', headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()), body: JSON.stringify(payload) })\n"
+"            .then(r => { if (r.status === 401) { logout(); return Promise.reject('Unauthorized'); } return r.json(); })\n"
+"            .then(data => {\n"
 "                if (data.status === 'ok') {\n"
 "                    showStatus(service.toUpperCase() + ' ' + (enabled ? 'enabled' : 'disabled'), 'success');\n"
 "                } else {\n"
@@ -305,7 +404,10 @@ static const char* html_page =
 "            }\n"
 "        }\n"
 "        function updateStatus() {\n"
-"            fetch('/api/status').then(r => r.json()).then(data => {\n"
+"            fetch('/api/status', { headers: getAuthHeaders() }).then(r => {\n"
+"                if (r.status === 401) { logout(); return Promise.reject('Unauthorized'); }\n"
+"                return r.json();\n"
+"            }).then(data => {\n"
 "                hideConnectionLostPopup();\n"
 "                // GNSS indicator\n"
 "                var gnss = data.gnss_ok !== undefined ? data.gnss_ok : false;\n"
@@ -379,9 +481,14 @@ static const char* html_page =
 "                showConnectionLostPopup();\n"
 "            });\n"
 "        }\n"
-"        loadConfig();\n"
-"        setInterval(updateStatus, 5000);\n"
-"        updateStatus();\n"
+"        // --- Initial auth check ---\n"
+"        if (localStorage.getItem('session_token')) {\n"
+"            showMain();\n"
+"            loadConfig();\n"
+"            updateStatus();\n"
+"        } else {\n"
+"            showLogin();\n"
+"        }\n"
 "    </script>\n"
 "    </div>\n"
 "</body>\n"
@@ -396,10 +503,27 @@ static esp_err_t root_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// Helper to check session token from Authorization header
+static bool check_auth(httpd_req_t *req) {
+    char buf[128];
+    size_t hlen = httpd_req_get_hdr_value_len(req, "Authorization");
+    if (hlen == 0 || hlen >= sizeof(buf)) return false;
+    if (httpd_req_get_hdr_value_str(req, "Authorization", buf, sizeof(buf)) != ESP_OK) return false;
+    const char *prefix = "Bearer ";
+    if (strncmp(buf, prefix, strlen(prefix)) != 0) return false;
+    const char *token = buf + strlen(prefix);
+    return strcmp(token, SESSION_TOKEN) == 0;
+}
+
 /**
  * @brief Handler for GET /api/config
  */
 static esp_err_t api_config_get_handler(httpd_req_t *req) {
+    if (!check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+        return ESP_FAIL;
+    }
     app_config_t config;
     if (config_get_all(&config) != ESP_OK) {
         httpd_resp_set_status(req, "500 Internal Server Error");
@@ -464,6 +588,11 @@ static esp_err_t api_config_get_handler(httpd_req_t *req) {
  * @brief Handler for POST /api/config
  */
 static esp_err_t api_config_post_handler(httpd_req_t *req) {
+    if (!check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+        return ESP_FAIL;
+    }
     char content[2048];
     int ret, remaining = req->content_len;
     
@@ -640,6 +769,11 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
  * @brief Handler for GET /api/status
  */
 static esp_err_t api_status_get_handler(httpd_req_t *req) {
+    if (!check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+        return ESP_FAIL;
+    }
     wifi_status_t wifi_status;
     wifi_manager_get_status(&wifi_status);
 
@@ -689,6 +823,11 @@ static esp_err_t api_status_get_handler(httpd_req_t *req) {
  * @brief Handler for POST /api/toggle
  */
 static esp_err_t api_toggle_post_handler(httpd_req_t *req) {
+    if (!check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+        return ESP_FAIL;
+    }
     char content[128];
     int ret = httpd_req_recv(req, content, sizeof(content) - 1);
     
@@ -753,6 +892,11 @@ static esp_err_t api_toggle_post_handler(httpd_req_t *req) {
  * @brief Handler for POST /api/restart
  */
 static esp_err_t api_restart_post_handler(httpd_req_t *req) {
+    if (!check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Device restarting in 3 seconds\"}");
     
@@ -769,6 +913,11 @@ static esp_err_t api_restart_post_handler(httpd_req_t *req) {
  * @brief Handler for POST /api/factory_reset
  */
 static esp_err_t api_factory_reset_post_handler(httpd_req_t *req) {
+    if (!check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\",\"message\":\"Factory reset initiated\"}");
     
@@ -860,6 +1009,15 @@ esp_err_t http_server_start(void) {
         .user_ctx = NULL
     };
     httpd_register_uri_handler(server, &uri_api_factory_reset);
+
+    // Register /api/login endpoint
+    httpd_uri_t uri_api_login = {
+        .uri = "/api/login",
+        .method = HTTP_POST,
+        .handler = api_login_post_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &uri_api_login);
     
     ESP_LOGI(TAG, "HTTP server started successfully");
     ESP_LOGI(TAG, "Access web interface at: http://192.168.4.1");

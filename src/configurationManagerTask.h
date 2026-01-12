@@ -200,6 +200,14 @@ extern "C" {
 #endif
 
 /**
+ * @brief Test if provided UI password matches the one stored in NVS
+ *
+ * @param password The password to test
+ * @return true if matches, false otherwise
+ */
+bool config_test_ui_password(const char* password);
+
+/**
  * @brief Get the default UI password string (for web UI warning)
  */
 const char* config_get_default_ui_password(void);

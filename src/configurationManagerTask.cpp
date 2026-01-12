@@ -690,3 +690,16 @@ EventBits_t config_wait_for_event(EventBits_t bits_to_wait_for, TickType_t timeo
 const char* config_get_default_ui_password(void) {
     return default_config.ui.password;
 }
+
+/**
+ * @brief Test if provided UI password matches the one stored in NVS
+ */
+bool config_test_ui_password(const char* password) {
+    if (!password) return false;
+    ui_config_t ui_cfg = {0};
+    if (nvs_load_ui(&ui_cfg) != ESP_OK) {
+        // If not found in NVS, fall back to default
+        return strcmp(password, default_config.ui.password) == 0;
+    }
+    return strcmp(password, ui_cfg.password) == 0;
+}
