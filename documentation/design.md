@@ -448,31 +448,6 @@ httpd_start(&server, &config);
 
 ### HTTP Handler Registration:
 
-```c
-// Static content
-httpd_uri_t uri_root = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = root_get_handler
-};
-httpd_register_uri_handler(server, &uri_root);
-
-// REST API
-httpd_uri_t uri_api_config_get = {
-    .uri = "/api/config",
-    .method = HTTP_GET,
-    .handler = api_config_get_handler
-};
-httpd_register_uri_handler(server, &uri_api_config_get);
-
-httpd_uri_t uri_api_config_post = {
-    .uri = "/api/config",
-    .method = HTTP_POST,
-    .handler = api_config_post_handler
-};
-httpd_register_uri_handler(server, &uri_api_config_post);
-```
-
 ### Security Considerations:
 
  - **HTTP Basic Authentication**: Required for all configuration endpoints
@@ -646,23 +621,6 @@ Content-Type: gnss/data
 
 **Configuration:** See `ntrip_config_t` defined in Configuration Manager section.
 
-**Runtime Status:**
-```c
-typedef struct {
-    bool connected;
-    uint32_t bytes_received;
-    uint32_t rtcm_packets_sent;
-    uint32_t gga_updates_sent;
-    time_t last_data_time;
-    char last_error[64];
-} ntrip_status_t;
-
-typedef struct {
-    uint8_t data[512];
-    size_t length;
-} rtcm_packet_t;
-```
-
 ### Queues:
 - **rtcm_queue** (output): Sends RTCM packets to GNSS Receiver Task
   - Type: `rtcm_packet_t`
@@ -676,144 +634,6 @@ typedef struct {
   - Size: 2 items
   - Blocking: **No** - Overwrite if full
   - Strategy: Only latest GGA position needed for caster updates
-
-### Queue Creation and Initialization:
-
-```c
-// Create queues in main initialization
-QueueHandle_t rtcm_queue;
-QueueHandle_t gga_queue;
-
-void initQueues(void) {
-    // RTCM queue: 10 packets deep for buffering bursts
-    rtcm_queue = xQueueCreate(10, sizeof(rtcm_packet_t));
-    if (rtcm_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create rtcm_queue");
-    }
-    
-    // GGA queue: Only 1 item needed (always latest position)
-    // Using size 2 for safety/flexibility
-    gga_queue = xQueueCreate(2, 128); // 128 bytes for GGA string
-    if (gga_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create gga_queue");
-    }
-}
-```
-
-**Alternative: Using xQueueOverwrite() for GGA Queue:**
-
-For `gga_queue`, since only the latest GGA is needed, consider using `xQueueOverwrite()`:
-
-```c
-// Create as queue of length 1
-gga_queue = xQueueCreate(1, 128);
-
-// In GNSS Receiver Task - always overwrite with latest
-xQueueOverwrite(gga_queue, gga_buffer);  // Replaces existing item
-
-// In NTRIP Client Task - always read latest
-if (xQueuePeek(gga_queue, gga_buffer, 0) == pdTRUE) {
-    sendGGA(gga_buffer);
-}
-```
-
-This eliminates the need to manually drop items for the GGA queue.
-
-### Arduino Framework Integration (Current Code):
-
-The existing `NTRIPClient` class provides the core functionality:
-
-```cpp
-// From NTRIPClient.h (Arduino-based, requires porting to ESP-IDF)
-class NTRIPClient : public WiFiClient {
-    // Request RAW data from NTRIP Caster
-    bool reqRaw(const char* host, int &port, const char* mntpnt, 
-                const char* user, const char* psw);
-    
-    // Send GGA sentence to NTRIP Caster
-    void sendGGA(const char* gga);
-    
-    // Read line from caster
-    int readLine(char* buffer, int size);
-    
-    // Request source table (for debugging/discovery)
-    bool reqSrcTbl(const char* host, int &port, 
-                   const char* user, const char* psw);
-};
-```
-
-### Task Loop Structure:
-
-```c
-void vNTRIPClientTask(void *pvParameters) {
-    ntrip_config_t config;
-    rtcm_packet_t rtcm_packet;
-    char gga_buffer[128];
-    TickType_t last_gga_time = 0;
-    
-    // Load configuration from NVS
-    loadNTRIPConfig(&config);
-    
-    while (1) {
-        // Establish connection
-        if (!ntripConnect(&config)) {
-            vTaskDelay(pdMS_TO_TICKS(reconnect_delay * 1000));
-            continue;
-        }
-        
-        ESP_LOGI(TAG, "NTRIP connected to %s:%d/%s", 
-                 config.host, config.port, config.mountpoint);
-        
-        // Main streaming loop
-        while (connected) {
-            // Check for GGA updates from queue
-            if (xQueueReceive(gga_queue, gga_buffer, 0) == pdTRUE) {
-                sendGGA(gga_buffer);
-                last_gga_time = xTaskGetTickCount();
-            }
-            
-            // Send periodic GGA if interval elapsed
-            if ((xTaskGetTickCount() - last_gga_time) > 
-                pdMS_TO_TICKS(config.gga_interval_sec * 1000)) {
-                if (xQueuePeek(gga_queue, gga_buffer, 0) == pdTRUE) {
-                    sendGGA(gga_buffer);
-                    last_gga_time = xTaskGetTickCount();
-                }
-            }
-            
-            // Read RTCM data from stream
-            if (available()) {
-                rtcm_packet.length = read(rtcm_packet.data, 
-                                         sizeof(rtcm_packet.data));
-                if (rtcm_packet.length > 0) {
-                    // Send to GNSS receiver via queue (non-blocking)
-                    // If queue full, drop oldest and add new
-                    if (xQueueSend(rtcm_queue, &rtcm_packet, 0) != pdTRUE) {
-                        // Queue full - remove oldest item
-                        rtcm_packet_t dummy;
-                        xQueueReceive(rtcm_queue, &dummy, 0);
-                        // Add new item
-                        xQueueSend(rtcm_queue, &rtcm_packet, 0);
-                        ESP_LOGW(TAG, "RTCM queue full, dropped oldest packet");
-                    }
-                }
-            } else {
-                // No data, check timeout
-                if ((xTaskGetTickCount() - last_data_time) > 
-                    pdMS_TO_TICKS(30000)) {
-                    ESP_LOGW(TAG, "NTRIP timeout, reconnecting");
-                    break; // Reconnect
-                }
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-        }
-        
-        // Disconnected, cleanup and retry
-        ntripDisconnect();
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-}
-```
 
 ### ESP-IDF Porting Requirements:
 
@@ -845,29 +665,6 @@ The current `NTRIPClient` code uses Arduino framework and requires porting to ES
 
 ### HTTP Client Configuration (ESP-IDF):
 
-```c
-esp_http_client_config_t http_config = {
-    .url = ntrip_url,  // "http://host:port/mountpoint"
-    .method = HTTP_METHOD_GET,
-    .timeout_ms = 10000,
-    .buffer_size = 2048,
-    .disable_auto_redirect = true,
-};
-
-esp_http_client_handle_t client = esp_http_client_init(&http_config);
-
-// Add authentication header
-char auth_header[256];
-sprintf(auth_header, "%s:%s", config.user, config.password);
-char auth_encoded[256];
-mbedtls_base64_encode(auth_encoded, sizeof(auth_encoded), 
-                      &out_len, (uint8_t*)auth_header, strlen(auth_header));
-
-char auth_full[300];
-sprintf(auth_full, "Basic %s", auth_encoded);
-esp_http_client_set_header(client, "Authorization", auth_full);
-esp_http_client_set_header(client, "Ntrip-Version", "Ntrip/2.0");
-```
 
 ### Implementation Notes:
 - RTCM3 messages are binary, handle as raw bytes
@@ -924,41 +721,6 @@ esp_http_client_set_header(client, "Ntrip-Version", "Ntrip/2.0");
 
 ### Data Structures:
 
-```c
-typedef struct {
-    // Raw NMEA sentences (for reference/logging)
-    char gga[128];      // Latest GGA sentence
-    char rmc[128];      // Latest RMC sentence
-    char vtg[128];      // Latest VTG sentence
-    
-    // Parsed position data (ready for consumption by other tasks)
-    double latitude;           // Decimal degrees (DD.DDDDDDD)
-    double longitude;          // Decimal degrees (DD.DDDDDDD)
-    float altitude;            // Meters above sea level
-    float speed;               // Ground speed in m/s (converted from knots)
-    float heading;             // True heading in degrees (0-359.99)
-    
-    // Fix quality indicators
-    uint8_t fix_quality;       // GGA field 6: 0=no fix, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK float
-    uint8_t satellites;        // Number of satellites in fix
-    float hdop;                // Horizontal dilution of precision
-    float dgps_age;            // Age of differential corrections in seconds
-    
-    // Timestamp
-    char datetime_iso8601[32]; // ISO 8601 format: "YYYY-MM-DD HH:mm:ss.SSS"
-    time_t timestamp;          // Last update time (system time)
-    bool valid;                // Data validity flag
-} gnss_data_t;
-
-typedef struct {
-    uint16_t gga_interval_sec;
-} gnss_config_t;
-
-// Fixed UART2 configuration:
-// - Baud: 460800
-// - TX: GPIO 17
-// - RX: GPIO 18
-```
 
 ### Queues:
 - **rtcm_queue**: Receives RTCM packets from NTRIP Client (input)
@@ -967,35 +729,10 @@ typedef struct {
 ### NMEA Parsing Implementation:
 
 **Coordinate Conversion** (NMEA DDMM.MMMMM → Decimal Degrees DD.DDDDDDD):
-```c
-// Example: GGA latitude = "5212.688959,N" → 52.211483
-// Example: GGA longitude = "00559.0198035,E" → 5.983663
-
-double nmea_to_decimal_degrees(double nmea_value, char direction) {
-    int degrees = (int)(nmea_value / 100.0);
-    double minutes = nmea_value - (degrees * 100.0);
-    double decimal = degrees + (minutes / 60.0);
-    
-    // Apply hemisphere sign
-    if (direction == 'S' || direction == 'W') {
-        decimal = -decimal;
-    }
-    return decimal;
-}
-```
 
 **Speed Conversion** (Knots → m/s):
-```c
-float speed_ms = speed_knots * 0.514444;
-```
 
 **ISO 8601 Date-Time Formatting**:
-```c
-// From RMC date (DDMMYY) and time (HHMMSS.sss)
-// Format: "2025-03-28 10:27:06.200"
-sprintf(gnss_data.datetime_iso8601, "%04d-%02d-%02d %02d:%02d:%02d.%03d",
-        year, month, day, hour, minute, second, millisecond);
-```
 
 ### Implementation Notes:
 - Use UART event queue for efficient RX processing
@@ -1099,28 +836,6 @@ If CRC high byte (0xA3) or low byte (0xB2) were 0x01, 0x10, or 0x18, they would 
 
 ### Data Structures:
 
-```c
-typedef struct {
-    uint32_t interval_ms;
-    bool enabled;  // Default: true
-} data_output_config_t;
-
-// Fixed UART1 configuration:
-// - Baud: 115200
-// - TX: GPIO 15
-// - RX: GPIO 16 (unused)
-
-typedef struct {
-    uint8_t day, month, year;
-    uint8_t hour, minute, second;
-    uint16_t millisecond;
-    double latitude;
-    double longitude;
-    float altitude;
-    float heading;
-    float speed;
-} position_data_t;
-```
 
 ### Implementation Notes:
 - Use `vTaskDelay(pdMS_TO_TICKS(100))` for 100ms interval
@@ -1197,37 +912,6 @@ typedef struct {
 ### Data Structures:
 
 ```c
-typedef struct {
-    bool wifi_sta_connected;
-    bool ntrip_connected;
-    bool ntrip_data_activity;      // RTCM received in last 2 seconds
-    bool mqtt_connected;
-    bool mqtt_activity;             // Message sent/received in last 2 seconds
-    uint8_t gps_fix_quality;        // 0=no fix, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK float
-    bool gps_data_valid;            // Valid GGA data available
-    time_t last_ntrip_data_time;
-    time_t last_mqtt_activity_time;
-} led_status_t;
-
-typedef enum {
-    LED_OFF = 0,
-    LED_ON = 1,
-    LED_BLINK = 2
-} led_state_t;
-
-typedef struct {
-    uint8_t r;
-    uint8_t g;
-    uint8_t b;
-} rgb_color_t;
-
-// Predefined colors for Neopixel status
-#define RGB_OFF         {0, 0, 0}
-#define RGB_GREEN       {0, 255, 0}
-#define RGB_YELLOW      {255, 255, 0}
-#define RGB_RED         {255, 0, 0}
-#define RGB_BLUE        {0, 0, 255}
-```
 
 ### LED State Logic:
 
@@ -1237,55 +921,14 @@ wifi_led_state = wifi_sta_connected ? LED_ON : LED_OFF;
 ```
 
 **NTRIP LED Logic**:
-```c
-if (!ntrip_connected) {
-    ntrip_led_state = LED_OFF;
-} else if (time_since_last_rtcm < 2000ms) {
-    ntrip_led_state = LED_BLINK;
-} else {
-    ntrip_led_state = LED_ON;
-}
-```
 
 **MQTT LED Logic**:
-```c
-if (!mqtt_connected) {
-    mqtt_led_state = LED_OFF;
-} else if (time_since_last_mqtt_activity < 2000ms) {
-    mqtt_led_state = LED_BLINK;
-} else {
-    mqtt_led_state = LED_ON;
-}
-```
 
 **FIX_RTK_LED Logic**:
-```c
-fix_rtk_led_state = (gps_data_valid && gps_fix_quality >= 1) ? LED_ON : LED_OFF;
-```
 
 **FIX_RTKFLOAT_LED Logic**:
-```c
-if (gps_fix_quality == 2) {
-    fix_rtkfloat_led_state = LED_BLINK;  // RTK Float
-} else if (gps_fix_quality >= 4) {
-    fix_rtkfloat_led_state = LED_ON;     // RTK Fixed
-} else {
-    fix_rtkfloat_led_state = LED_OFF;    // No RTK
-}
-```
 
 **Neopixel RGB LED Logic**:
-```c
-if (system_error) {
-    rgb_color = RGB_RED;
-} else if (!wifi_sta_connected) {
-    rgb_color = RGB_YELLOW;  // AP only mode
-} else if (all_enabled_services_running) {
-    rgb_color = RGB_GREEN;   // Full operation
-} else {
-    rgb_color = RGB_YELLOW;  // Partial operation
-}
-```
 
 ### Status Monitoring Sources:
 
@@ -1304,121 +947,12 @@ if (system_error) {
 
 ### Task Loop Structure:
 
-```c
-void vLEDIndicatorTask(void *pvParameters) {
-    led_status_t status = {0};
-    uint32_t blink_counter = 0;
-    bool blink_state = false;
-    
-    ESP_LOGI(TAG, "LED Indicator Task started");
-    
-    // Initialize GPIO pins for LEDs
-    initLEDGPIOs();
-    
-    // Initialize Neopixel (if using library like esp_led_strip)
-    initNeopixelLED();
-    
-    while (1) {
-        // Update blink counter (toggles every 500ms for 1 Hz blink)
-        blink_counter++;
-        if (blink_counter >= 5) {  // 5 * 100ms = 500ms
-            blink_state = !blink_state;
-            blink_counter = 0;
-        }
-        
-        // Collect status from all subsystems
-        status.wifi_sta_connected = wifi_manager_is_sta_connected();
-        status.ntrip_connected = ntrip_client_is_connected();
-        status.mqtt_connected = mqtt_is_connected();
-        
-        // Get GNSS data for fix quality
-        gnss_data_t gnss_data;
-        gnss_get_data(&gnss_data);
-        status.gps_data_valid = gnss_data.valid;
-        status.gps_fix_quality = parseGGAFixQuality(gnss_data.gga);
-        
-        // Check activity timestamps
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        time_t now = tv.tv_sec;
-        
-        status.ntrip_data_activity = (now - status.last_ntrip_data_time) < 2;
-        status.mqtt_activity = (now - status.last_mqtt_activity_time) < 2;
-        
-        // Update discrete LEDs
-        updateLED(WIFI_LED, status.wifi_sta_connected);
-        updateLED(NTRIP_LED, calculateNTRIPLEDState(&status, blink_state));
-        updateLED(MQTT_LED, calculateMQTTLEDState(&status, blink_state));
-        updateLED(FIX_RTK_LED, status.gps_data_valid && status.gps_fix_quality >= 1);
-        updateLED(FIX_RTKFLOAT_LED, calculateRTKFloatLEDState(&status, blink_state));
-        
-        // Update Neopixel RGB LED
-        rgb_color_t rgb = calculateSystemStatusColor(&status);
-        updateNeopixel(rgb.r, rgb.g, rgb.b);
-        
-        // Delay 100ms for 10 Hz update rate
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-```
 
 ### GPIO Configuration:
-
-```c
-void initLEDGPIOs(void) {
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << WIFI_LED) | 
-                       (1ULL << NTRIP_LED) | 
-                       (1ULL << MQTT_LED) | 
-                       (1ULL << FIX_RTK_LED) | 
-                       (1ULL << FIX_RTKFLOAT_LED),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    
-    // Initialize all LEDs to OFF
-    gpio_set_level(WIFI_LED, 0);
-    gpio_set_level(NTRIP_LED, 0);
-    gpio_set_level(MQTT_LED, 0);
-    gpio_set_level(FIX_RTK_LED, 0);
-    gpio_set_level(FIX_RTKFLOAT_LED, 0);
-}
-```
 
 ### Neopixel Integration:
 
 Use ESP-IDF component `led_strip` for Neopixel control:
-```c
-#include "led_strip.h"
-
-static led_strip_handle_t led_strip;
-
-void initNeopixelLED(void) {
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = STATUS_LED_PIN,  // GPIO 38
-        .max_leds = 1,
-        .led_pixel_format = LED_PIXEL_FORMAT_GRB,
-        .led_model = LED_MODEL_WS2812,
-        .flags.invert_out = false,
-    };
-    
-    led_strip_rmt_config_t rmt_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000, // 10 MHz
-        .flags.with_dma = false,
-    };
-    
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-}
-
-void updateNeopixel(uint8_t r, uint8_t g, uint8_t b) {
-    led_strip_set_pixel(led_strip, 0, r, g, b);
-    led_strip_refresh(led_strip);
-}
-```
 
 ### Implementation Notes:
 - Task priority: 2 (lower than critical communication tasks)
@@ -2159,363 +1693,25 @@ MQTT Client Task
 
 ### Task Loop Structure:
 
-```c
-void vMQTTClientTask(void *pvParameters) {
-    mqtt_config_t config;
-    mqtt_gnss_message_t gnss_msg;
-    uint32_t message_counter = 0;
-    uint32_t gnss_counter = 0;
-    uint32_t status_counter = 0;
-    uint32_t stats_counter = 0;
-    
-    // Load configuration from NVS
-    loadMQTTConfig(&config);
-    
-    if (!config.enabled) {
-        ESP_LOGI(TAG, "MQTT client disabled in configuration");
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    // Initialize MQTT client
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = config.broker,
-        .broker.address.port = config.port,
-        .credentials.username = config.user,
-        .credentials.password = config.password,
-    };
-    
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-    esp_mqtt_client_start(client);
-    
-    while (1) {
-        // 1 second tick for interval management
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        
-        // Check if connected
-        if (!mqtt_is_connected()) {
-            continue;
-        }
-        
-        gnss_counter++;
-        status_counter++;
-        stats_counter++;
-        
-        // Publish GNSS position data
-        if (gnss_counter >= config.gnss_interval_sec) {
-            gnss_counter = 0;
-            
-            // Read latest GNSS data (already parsed by GNSS Receiver Task)
-            gnss_data_t gnss_data;
-            if (gnss_get_data(&gnss_data) && gnss_data.valid) {
-                // Map pre-parsed data to MQTT message structure
-                gnss_msg.lat = gnss_data.latitude;
-                gnss_msg.lon = gnss_data.longitude;
-                gnss_msg.alt = gnss_data.altitude;
-                gnss_msg.fix_type = gnss_data.fix_quality;
-                gnss_msg.speed = gnss_data.speed;
-                gnss_msg.dir = gnss_data.heading;
-                gnss_msg.sats = gnss_data.satellites;
-                gnss_msg.hdop = gnss_data.hdop;
-                gnss_msg.age = gnss_data.dgps_age;
-                strncpy(gnss_msg.daytime, gnss_data.datetime_iso8601, sizeof(gnss_msg.daytime));
-                gnss_msg.num = ++message_counter;
-                
-                // Format and publish
-                char json_buffer[512];
-                format_gnss_json(&gnss_msg, json_buffer, sizeof(json_buffer));
-                
-                char topic[128];
-                snprintf(topic, sizeof(topic), "%s/GNSS", config.topic);
-                esp_mqtt_client_publish(client, topic, json_buffer, strlen(json_buffer), 0, 0);
-                
-                ESP_LOGI(TAG, "Published GNSS #%lu", message_counter);
-            }
-        }
-        
-        // Publish system status (cumulative runtime data)
-        if (status_counter >= config.status_interval_sec) {
-            status_counter = 0;
-            
-            mqtt_status_message_t status_msg;
-            collect_system_status(&status_msg);
-            
-            char json_buffer[1024];
-            format_status_json(&status_msg, json_buffer, sizeof(json_buffer));
-            
-            char topic[128];
-            snprintf(topic, sizeof(topic), "%s/status", config.topic);
-            esp_mqtt_client_publish(client, topic, json_buffer, strlen(json_buffer), 0, 0);
-            
-            ESP_LOGI(TAG, "Published system status");
-        }
-        
-        // Publish period statistics
-        if (stats_counter >= config.stats_interval_sec) {
-            stats_counter = 0;
-            
-            mqtt_stats_message_t stats_msg;
-            collect_period_statistics(&stats_msg);
-            
-            char json_buffer[1024];
-            format_stats_json(&stats_msg, json_buffer, sizeof(json_buffer));
-            
-            char topic[128];
-            snprintf(topic, sizeof(topic), "%s/stats", config.topic);
-            esp_mqtt_client_publish(client, topic, json_buffer, strlen(json_buffer), 0, 0);
-            
-            ESP_LOGI(TAG, "Published statistics");
-        }
-    }
-}
-```
 
 ### JSON Formatting Functions:
 
 **GNSS Position Message:**
-```c
-void format_gnss_json(const mqtt_gnss_message_t *msg, char *buffer, size_t size) {
-    snprintf(buffer, size,
-        "{\n"
-        "   \"num\": %lu,\n"
-        "   \"daytime\": \"%s\",\n"
-        "   \"lat\": %.7f,\n"
-        "   \"lon\": %.7f,\n"
-        "   \"alt\": %.3f,\n"
-        "   \"fix_type\": %u,\n"
-        "   \"speed\": %.2f,\n"
-        "   \"dir\": %.1f,\n"
-        "   \"sats\": %u,\n"
-        "   \"hdop\": %.2f,\n"
-        "   \"age\": %.1f\n"
-        "}",
-        msg->num,
-        msg->daytime,
-        msg->lat,
-        msg->lon,
-        msg->alt,
-        msg->fix_type,
-        msg->speed,
-        msg->dir,
-        msg->sats,
-        msg->hdop,
-        msg->age
-    );
-}
-```
 
 **System Status Message:**
-```c
-void format_status_json(const mqtt_status_message_t *msg, char *buffer, size_t size) {
-    snprintf(buffer, size,
-        "{\n"
-        "   \"timestamp\": \"%s\",\n"
-        "   \"uptime_sec\": %lu,\n"
-        "   \"heap_free\": %lu,\n"
-        "   \"heap_min\": %lu,\n"
-        "   \"wifi\": {\n"
-        "      \"connected\": %s,\n"
-        "      \"rssi_dbm\": %d\n"
-        "   },\n"
-        "   \"ntrip\": {\n"
-        "      \"connected\": %s,\n"
-        "      \"uptime_sec\": %lu,\n"
-        "      \"rtcm_packets_total\": %lu\n"
-        "   },\n"
-        "   \"mqtt\": {\n"
-        "      \"connected\": %s,\n"
-        "      \"uptime_sec\": %lu,\n"
-        "      \"messages_published\": %lu\n"
-        "   },\n"
-        "   \"gnss\": {\n"
-        "      \"current_fix\": %u\n"
-        "   }\n"
-        "}",
-        msg->timestamp,
-        msg->uptime_sec,
-        msg->heap_free,
-        msg->heap_min,
-        msg->wifi_connected ? "true" : "false",
-        msg->wifi_rssi,
-        msg->ntrip_connected ? "true" : "false",
-        msg->ntrip_uptime_sec,
-        msg->rtcm_packets_total,
-        msg->mqtt_connected ? "true" : "false",
-        msg->mqtt_uptime_sec,
-        msg->mqtt_published,
-        msg->current_fix
-    );
-}
-```
 
 **Statistics Message:**
-```c
-void format_stats_json(const mqtt_stats_message_t *msg, char *buffer, size_t size) {
-    snprintf(buffer, size,
-        "{\n"
-        "   \"timestamp\": \"%s\",\n"
-        "   \"period_sec\": %lu,\n"
-        "   \"rtcm\": {\n"
-        "      \"bytes_received\": %lu,\n"
-        "      \"message_rate\": %lu,\n"
-        "      \"data_gaps\": %lu\n"
-        "   },\n"
-        "   \"gnss\": {\n"
-        "      \"fix_duration\": {\n"
-        "         \"no_fix\": %lu,\n"
-        "         \"gps\": %lu,\n"
-        "         \"dgps\": %lu,\n"
-        "         \"rtk_float\": %lu,\n"
-        "         \"rtk_fixed\": %lu\n"
-        "      },\n"
-        "      \"rtk_fixed_percent\": %.1f,\n"
-        "      \"hdop_avg\": %.2f,\n"
-        "      \"sats_avg\": %u\n"
-        "   },\n"
-        "   \"wifi\": {\n"
-        "      \"rssi_avg\": %d,\n"
-        "      \"uptime_percent\": %.1f\n"
-        "   },\n"
-        "   \"errors\": {\n"
-        "      \"nmea_checksum\": %lu,\n"
-        "      \"uart\": %lu,\n"
-        "      \"rtcm_queue_overflow\": %lu\n"
-        "   }\n"
-        "}",
-        msg->timestamp,
-        msg->period_duration,
-        msg->rtcm_bytes_received,
-        msg->rtcm_message_rate,
-        msg->rtcm_data_gaps,
-        msg->fix_quality_duration[0],  // no_fix
-        msg->fix_quality_duration[1],  // gps
-        msg->fix_quality_duration[2],  // dgps
-        msg->fix_quality_duration[5],  // rtk_float
-        msg->fix_quality_duration[4],  // rtk_fixed
-        msg->rtk_fixed_percent,
-        msg->hdop_avg,
-        msg->sats_avg,
-        msg->wifi_rssi_avg,
-        msg->wifi_uptime_percent,
-        msg->nmea_errors,
-        msg->uart_errors,
-        msg->rtcm_queue_overflows
-    );
-}
-```
 
 ### ESP-IDF MQTT Client Integration:
 
 The ESP-IDF provides a built-in MQTT client library:
 
-```c
-#include "mqtt_client.h"
-
-// Event handler for MQTT events
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
-                               int32_t event_id, void *event_data)
-{
-    esp_mqtt_event_handle_t event = event_data;
-    
-    switch ((esp_mqtt_event_id_t)event_id) {
-        case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "MQTT connected to broker");
-            set_mqtt_connected(true);
-            break;
-            
-        case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "MQTT disconnected from broker");
-            set_mqtt_connected(false);
-            break;
-            
-        case MQTT_EVENT_PUBLISHED:
-            ESP_LOGI(TAG, "MQTT message published, msg_id=%d", event->msg_id);
-            break;
-            
-        case MQTT_EVENT_ERROR:
-            ESP_LOGE(TAG, "MQTT error: %s", strerror(event->error_handle->esp_transport_sock_errno));
-            break;
-            
-        default:
-            break;
-    }
-}
-```
 
 ### Data Collection Functions:
 
 **Collect System Status** (cumulative runtime data):
-```c
-void collect_system_status(mqtt_status_message_t *msg) {
-    // Get current timestamp
-    format_iso8601_timestamp(msg->timestamp, sizeof(msg->timestamp));
-    
-    // System metrics
-    msg->uptime_sec = esp_timer_get_time() / 1000000;
-    msg->heap_free = esp_get_free_heap_size();
-    msg->heap_min = esp_get_minimum_free_heap_size();
-    
-    // WiFi status
-    msg->wifi_connected = wifi_manager_is_sta_connected();
-    if (msg->wifi_connected) {
-        wifi_ap_record_t ap_info;
-        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
-            msg->wifi_rssi = ap_info.rssi;
-        }
-    }
-    
-    // NTRIP status (from Statistics Task runtime data)
-    runtime_statistics_t *runtime_stats = statistics_get_runtime();
-    msg->ntrip_connected = ntrip_is_connected();
-    msg->ntrip_uptime_sec = runtime_stats->ntrip_uptime_sec;
-    msg->rtcm_packets_total = runtime_stats->rtcm_messages_received_total;
-    
-    // MQTT status
-    msg->mqtt_connected = true;  // We're publishing, so we're connected
-    msg->mqtt_uptime_sec = mqtt_get_uptime_sec();
-    msg->mqtt_published = mqtt_get_publish_count();
-    
-    // GNSS status
-    gnss_data_t gnss_data;
-    if (gnss_get_data(&gnss_data)) {
-        msg->current_fix = gnss_data.fix_quality;
-    }
-}
-```
 
 **Collect Period Statistics** (interval data from Statistics Task):
-```c
-void collect_period_statistics(mqtt_stats_message_t *msg) {
-    // Get current timestamp
-    format_iso8601_timestamp(msg->timestamp, sizeof(msg->timestamp));
-    
-    // Query Statistics Task for period data
-    period_statistics_t *period_stats = statistics_get_period();
-    
-    msg->period_duration = period_stats->period_duration_sec;
-    
-    // RTCM metrics
-    msg->rtcm_bytes_received = period_stats->rtcm_bytes_received;
-    msg->rtcm_message_rate = period_stats->rtcm_message_rate;
-    msg->rtcm_data_gaps = period_stats->rtcm_data_gaps;
-    
-    // GNSS metrics
-    memcpy(msg->fix_quality_duration, period_stats->fix_quality_duration, sizeof(msg->fix_quality_duration));
-    msg->rtk_fixed_percent = period_stats->rtk_fixed_stability_percent;
-    msg->hdop_avg = period_stats->hdop_avg;
-    msg->sats_avg = period_stats->satellites_avg;
-    
-    // WiFi metrics
-    msg->wifi_rssi_avg = period_stats->wifi_rssi_avg;
-    msg->wifi_uptime_percent = period_stats->wifi_uptime_percent;
-    
-    // Error metrics
-    msg->nmea_errors = period_stats->nmea_checksum_errors;
-    msg->uart_errors = period_stats->uart_errors;
-    msg->rtcm_queue_overflows = period_stats->rtcm_queue_overflows;
-}
-```
 
 ### Implementation Notes:
 - Task priority: 2 (same as LED Indicator, lower than critical communication tasks)
@@ -2534,19 +1730,6 @@ void collect_period_statistics(mqtt_stats_message_t *msg) {
 
 ### Configuration Example:
 
-```c
-mqtt_config_t mqtt_config = {
-    .broker = "mqtt.example.com",
-    .port = 1883,
-    .topic = "ntripclient",          // Base topic
-    .user = "mqtt_user",
-    .password = "mqtt_password",
-    .gnss_interval_sec = 10,         // GNSS position every 10 seconds
-    .status_interval_sec = 120,      // System status every 120 seconds
-    .stats_interval_sec = 60,        // Statistics every 60 seconds
-    .enabled = true
-};
-```
 
 **Published Topics**:
 - `ntripclient/GNSS` - Position data every 10 seconds

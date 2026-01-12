@@ -66,14 +66,15 @@ static size_t build_telemetry_frame(const position_data_t* pos, uint8_t* frame, 
         return 0;
     }
 
-    // Format message string: YYYY-MM-DD HH:mm:ss.sss,LAT,LON,ALT,HEADING,SPEED
-    char message[128];
+    // Format message string: YYYY-MM-DD HH:mm:ss.sss,LAT,LON,ALT,HEADING,SPEED,FIXQ
+    char message[140];
     int msg_len = snprintf(message, sizeof(message),
-                          "%04d-%02d-%02d %02d:%02d:%02d.%03d,%.6f,%.6f,%.2f,%.2f,%.2f",
+                          "%04d-%02d-%02d %02d:%02d:%02d.%03d,%.6f,%.6f,%.2f,%.2f,%.2f,%u",
                           2000 + pos->year, pos->month, pos->day,
                           pos->hour, pos->minute, pos->second, pos->millisecond,
                           pos->latitude, pos->longitude,
-                          pos->altitude, pos->heading, pos->speed);
+                          pos->altitude, pos->heading, pos->speed,
+                          pos->fix_quality);
 
     if (msg_len <= 0 || msg_len >= (int)sizeof(message)) {
         ESP_LOGE(TAG, "Failed to format message");
@@ -219,6 +220,7 @@ static void data_output_task(void* pvParameters) {
         position.minute = gnss_data.minute;
         position.second = gnss_data.second;
         position.millisecond = gnss_data.millisecond;
+        position.fix_quality = gnss_data.fix_quality;
 
         // If no valid data, use default values
         if (!position.valid) {

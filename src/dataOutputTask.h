@@ -55,6 +55,7 @@ typedef struct {
     float heading;          ///< True heading in degrees (0-359.99)
     float speed;            ///< Ground speed in km/h
     bool valid;             ///< Data validity flag
+    uint8_t fix_quality;    ///< GNSS fix quality (0=no fix, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK float)
 } position_data_t;
 
 /**
