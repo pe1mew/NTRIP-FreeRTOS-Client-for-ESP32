@@ -20,6 +20,8 @@
 #include <freertos/event_groups.h>
 #include <cstring>
 
+#include "ledIndicatorTask.h"
+
 static const char* TAG = "NTRIPTask";
 
 // Queue handles (global, accessible from other tasks)

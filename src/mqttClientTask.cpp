@@ -5,6 +5,8 @@
 #include "wifiManager.h"
 #include "ntripClientTask.h"
 
+#include "ledIndicatorTask.h"
+
 #include <string.h>
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"

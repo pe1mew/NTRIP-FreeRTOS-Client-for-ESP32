@@ -12,6 +12,8 @@
 #include "statisticsTask.h"
 #include "mqttClientTask.h"
 
+#include "ledIndicatorTask.h"
+
 static const char *TAG = "MAIN";
 
 extern "C" void app_main(void) {
