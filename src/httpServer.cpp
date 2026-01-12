@@ -83,6 +83,11 @@ static const char* html_page =
 "        .gnss-bar-box { width: 18px; height: 18px; border: 2px solid #0066cc; margin-right: 3px; display: inline-block; border-radius: 3px; background: #fff; transition: background 0.2s, border-color 0.2s; }\n"
 "        .gnss-bar-box.filled { background: #0066cc; border-color: #0066cc; }\n"
 "        </style>\n"
+"        <h2>UI Password</h2>\n"
+"        <div class='form-group'>\n"
+"            <label>UI Password:</label>\n"
+"            <input type='password' id='ui_password' maxlength='63' placeholder='Leave blank to keep current password'>\n"
+"        </div>\n"
 "        <h2>WiFi Configuration</h2>\n"
 "        <div class='status-indicator-container' style='display: flex; align-items: center; margin-bottom: 15px;'>\n"
 "            <span style='color:#555; font-size:15px; font-weight:bold; margin-right:6px;'>Status:</span>\n"
@@ -202,6 +207,7 @@ static const char* html_page =
 "    <script>\n"
 "        function loadConfig() {\n"
 "            fetch('/api/config').then(r => r.json()).then(data => {\n"
+"                document.getElementById('ui_password').value = '';\n"
 "                document.getElementById('wifi_ssid').value = data.wifi.ssid;\n"
 "                document.getElementById('ap_ssid').value = data.wifi.ap_ssid || 'NTRIPClient';\n"
 "                // Don't populate password fields - leave empty with placeholder\n"
@@ -228,6 +234,7 @@ static const char* html_page =
 "                return;\n"
 "            }\n"
 "            const config = {\n"
+"                ui: { password: document.getElementById('ui_password').value },\n"
 "                wifi: { ssid: document.getElementById('wifi_ssid').value, password: document.getElementById('wifi_password').value, ap_password: document.getElementById('ap_password').value },\n"
 "                ntrip: { enabled: document.getElementById('ntrip_enabled').checked, host: document.getElementById('ntrip_host').value,\n"
 "                         port: parseInt(document.getElementById('ntrip_port').value), mountpoint: document.getElementById('ntrip_mountpoint').value,\n"
@@ -392,6 +399,10 @@ static esp_err_t api_config_get_handler(httpd_req_t *req) {
     }
     // Create JSON response (mask passwords)
     cJSON *root = cJSON_CreateObject();
+    // UI config
+    cJSON *ui = cJSON_CreateObject();
+    cJSON_AddStringToObject(ui, "password", "********");
+    cJSON_AddItemToObject(root, "ui", ui);
     // WiFi config
     cJSON *wifi = cJSON_CreateObject();
     cJSON_AddStringToObject(wifi, "ssid", config.wifi.ssid);
@@ -475,6 +486,16 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
     bool ntrip_changed = false;
     bool mqtt_changed = false;
     
+    // Parse UI config
+    cJSON *ui = cJSON_GetObjectItem(root, "ui");
+    if (ui) {
+        cJSON *password = cJSON_GetObjectItem(ui, "password");
+        if (password && cJSON_IsString(password) && strlen(password->valuestring) > 0) {
+            strncpy(config.ui.password, password->valuestring, sizeof(config.ui.password) - 1);
+            // No event bit for UI password, but always save
+            config_set_all(&config);
+        }
+    }
     // Parse WiFi config
     cJSON *wifi = cJSON_GetObjectItem(root, "wifi");
     if (wifi) {

@@ -13,12 +13,17 @@
 #define CONFIG_MQTT_CHANGED_BIT     (1 << 2)
 #define CONFIG_ALL_CHANGED_BIT      (CONFIG_WIFI_CHANGED_BIT | CONFIG_NTRIP_CHANGED_BIT | CONFIG_MQTT_CHANGED_BIT)
 
+
+// UI configuration structure
+typedef struct {
+    char password[64]; // UI password for web interface
+} ui_config_t;
+
 // WiFi configuration structure
 typedef struct {
     char ssid[32];
     char password[64];
     char ap_password[64];
-    char ui_password[64]; // UI password for web interface
 } app_wifi_config_t;
 
 // NTRIP configuration structure
@@ -48,6 +53,7 @@ typedef struct {
 
 // Application configuration structure (combined)
 typedef struct {
+    ui_config_t ui;
     app_wifi_config_t wifi;
     ntrip_config_t ntrip;
     mqtt_config_t mqtt;

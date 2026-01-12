@@ -23,11 +23,13 @@ static app_config_t app_config;
 
 // Default configuration values
 static const app_config_t default_config = {
+    .ui = {
+        .password = "admin" // Default UI password
+    },
     .wifi = {
         .ssid = "YourWiFiSSID",
         .password = "YourWiFiPassword",
-        .ap_password = "config123",
-        .ui_password = "admin" // Default UI password
+        .ap_password = "config123"
     },
     .ntrip = {
         .host = "rtk2go.com",
@@ -51,6 +53,56 @@ static const app_config_t default_config = {
         .enabled = false  // Disabled by default until configured
     }
 };
+
+/**
+ * @brief Load UI configuration from NVS
+ */
+static esp_err_t nvs_load_ui(ui_config_t* config) {
+    nvs_handle_t handle;
+    esp_err_t err;
+
+    err = nvs_open("ui", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "UI config not found in NVS, using defaults");
+        return err;
+    }
+
+    size_t size = sizeof(config->password);
+    err = nvs_get_str(handle, "password", config->password, &size);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read UI password from NVS");
+    }
+    nvs_close(handle);
+    return ESP_OK;
+}
+
+/**
+ * @brief Save UI configuration to NVS
+ */
+static esp_err_t nvs_save_ui(const ui_config_t* config) {
+    nvs_handle_t handle;
+    esp_err_t err;
+
+    err = nvs_open("ui", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for UI config: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_str(handle, "password", config->password);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write UI password to NVS: %s", esp_err_to_name(err));
+        nvs_close(handle);
+        return err;
+    }
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to commit UI config to NVS: %s", esp_err_to_name(err));
+    }
+    nvs_close(handle);
+    ESP_LOGI(TAG, "UI config saved to NVS");
+    return err;
+}
 
 /**
  * @brief Load WiFi configuration from NVS
@@ -81,12 +133,6 @@ static esp_err_t nvs_load_wifi(app_wifi_config_t* config) {
     err = nvs_get_str(handle, "ap_password", config->ap_password, &size);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to read AP password from NVS");
-    }
-
-    size = sizeof(config->ui_password);
-    err = nvs_get_str(handle, "ui_password", config->ui_password, &size);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read UI password from NVS");
     }
     nvs_close(handle);
     return ESP_OK;
@@ -122,13 +168,6 @@ static esp_err_t nvs_save_wifi(const app_wifi_config_t* config) {
     err = nvs_set_str(handle, "ap_password", config->ap_password);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write AP password to NVS: %s", esp_err_to_name(err));
-        nvs_close(handle);
-        return err;
-    }
-
-    err = nvs_set_str(handle, "ui_password", config->ui_password);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to write UI password to NVS: %s", esp_err_to_name(err));
         nvs_close(handle);
         return err;
     }
@@ -325,9 +364,11 @@ esp_err_t config_manager_init(void) {
     }
 
     // Load default configuration first
+
     config_load_defaults(&app_config);
 
     // Try to load configuration from NVS, keep defaults if not found
+    nvs_load_ui(&app_config.ui);
     nvs_load_wifi(&app_config.wifi);
     nvs_load_ntrip(&app_config.ntrip);
     nvs_load_mqtt(&app_config.mqtt);
@@ -551,12 +592,14 @@ esp_err_t config_set_all(const app_config_t* config) {
         memcpy(&app_config, config, sizeof(app_config_t));
         
         // Save all to NVS
+        esp_err_t err_ui = nvs_save_ui(&config->ui);
         esp_err_t err_wifi = nvs_save_wifi(&config->wifi);
         esp_err_t err_ntrip = nvs_save_ntrip(&config->ntrip);
         esp_err_t err_mqtt = nvs_save_mqtt(&config->mqtt);
         
         // Return first error encountered
-        if (err_wifi != ESP_OK) err = err_wifi;
+        if (err_ui != ESP_OK) err = err_ui;
+        else if (err_wifi != ESP_OK) err = err_wifi;
         else if (err_ntrip != ESP_OK) err = err_ntrip;
         else if (err_mqtt != ESP_OK) err = err_mqtt;
         
