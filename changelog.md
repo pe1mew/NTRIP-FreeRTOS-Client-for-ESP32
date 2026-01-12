@@ -10,6 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - Display a popup message in the browser when the connection to the ESP server is lost (periodic polling, auto-hide on reconnect)
 - The UI password can now be configured directly from the web UI.
 - Show a warning in the web UI when the UI password is still set to the factory default. The default password is now retrieved from the configuration manager for a single source of truth.
+- Web UI now requires login with the UI password; session token is used for all API requests.
+- All sensitive backend API endpoints now require authentication via session token (Authorization: Bearer ... header).
+- Logout button added to the bottom of the main UI for easy session termination.
 
 ### Changed
 - Telemetry output now includes GNSS fix quality indicator before CRC-16

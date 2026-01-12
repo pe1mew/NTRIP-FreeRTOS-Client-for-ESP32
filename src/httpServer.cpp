@@ -243,6 +243,7 @@ static const char* html_page =
 "            <button onclick='saveConfig()'>Save Configuration</button>\n"
 "            <button onclick='restartDevice()'>Restart Device</button>\n"
 "            <button onclick='factoryReset()' style='background: #dc3545;'>Factory Reset</button>\n"
+"            <button onclick='logout()'>Logout</button>\n"
 "        </div>\n"
 "    </div>\n"
 "    <div style='margin-top: 30px; margin-bottom: 10px;'>\n"
