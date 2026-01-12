@@ -26,7 +26,8 @@ static const app_config_t default_config = {
     .wifi = {
         .ssid = "YourWiFiSSID",
         .password = "YourWiFiPassword",
-        .ap_password = "config123"
+        .ap_password = "config123",
+        .ui_password = "admin" // Default UI password
     },
     .ntrip = {
         .host = "rtk2go.com",
@@ -81,6 +82,12 @@ static esp_err_t nvs_load_wifi(app_wifi_config_t* config) {
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to read AP password from NVS");
     }
+
+    size = sizeof(config->ui_password);
+    err = nvs_get_str(handle, "ui_password", config->ui_password, &size);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read UI password from NVS");
+    }
     nvs_close(handle);
     return ESP_OK;
 }
@@ -115,6 +122,13 @@ static esp_err_t nvs_save_wifi(const app_wifi_config_t* config) {
     err = nvs_set_str(handle, "ap_password", config->ap_password);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write AP password to NVS: %s", esp_err_to_name(err));
+        nvs_close(handle);
+        return err;
+    }
+
+    err = nvs_set_str(handle, "ui_password", config->ui_password);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write UI password to NVS: %s", esp_err_to_name(err));
         nvs_close(handle);
         return err;
     }

@@ -18,6 +18,7 @@ typedef struct {
     char ssid[32];
     char password[64];
     char ap_password[64];
+    char ui_password[64]; // UI password for web interface
 } app_wifi_config_t;
 
 // NTRIP configuration structure
