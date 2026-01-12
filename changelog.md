@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Added
 - Display a popup message in the browser when the connection to the ESP server is lost (periodic polling, auto-hide on reconnect)
+- The UI password can now be configured directly from the web UI.
+- Show a warning in the web UI when the UI password is still set to the factory default. The default password is now retrieved from the configuration manager for a single source of truth.
 
 ### Changed
 - Telemetry output now includes GNSS fix quality indicator before CRC-16

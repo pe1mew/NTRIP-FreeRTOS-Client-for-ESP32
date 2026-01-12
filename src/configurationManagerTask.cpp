@@ -685,3 +685,8 @@ EventBits_t config_wait_for_event(EventBits_t bits_to_wait_for, TickType_t timeo
         timeout_ticks
     );
 }
+
+// Expose the default UI password for web UI warning
+const char* config_get_default_ui_password(void) {
+    return default_config.ui.password;
+}

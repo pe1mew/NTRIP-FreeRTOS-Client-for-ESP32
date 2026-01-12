@@ -195,4 +195,17 @@ esp_err_t config_factory_reset(void);
  */
 void config_load_defaults(app_config_t* config);
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief Get the default UI password string (for web UI warning)
+ */
+const char* config_get_default_ui_password(void);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif // CONFIGURATION_MANAGER_TASK_H

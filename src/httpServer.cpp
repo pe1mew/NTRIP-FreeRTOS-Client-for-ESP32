@@ -84,6 +84,9 @@ static const char* html_page =
 "        .gnss-bar-box.filled { background: #0066cc; border-color: #0066cc; }\n"
 "        </style>\n"
 "        <h2>UI Password</h2>\n"
+"        <div id='ui_password_warning' class='status error' style='display:none;'>\n"
+"            <b>Warning:</b> The UI password is still set to the factory default. Please change it for security.\n"
+"        </div>\n"
 "        <div class='form-group'>\n"
 "            <label>UI Password:</label>\n"
 "            <input type='password' id='ui_password' maxlength='63' placeholder='Leave blank to keep current password'>\n"
@@ -208,6 +211,12 @@ static const char* html_page =
 "        function loadConfig() {\n"
 "            fetch('/api/config').then(r => r.json()).then(data => {\n"
 "                document.getElementById('ui_password').value = '';\n"
+"                // Show/hide UI password warning\n"
+"                if (data.ui && data.ui.password_is_default) {\n"
+"                    document.getElementById('ui_password_warning').style.display = 'block';\n"
+"                } else {\n"
+"                    document.getElementById('ui_password_warning').style.display = 'none';\n"
+"                }\n"
 "                document.getElementById('wifi_ssid').value = data.wifi.ssid;\n"
 "                document.getElementById('ap_ssid').value = data.wifi.ap_ssid || 'NTRIPClient';\n"
 "                // Don't populate password fields - leave empty with placeholder\n"
@@ -402,6 +411,10 @@ static esp_err_t api_config_get_handler(httpd_req_t *req) {
     // UI config
     cJSON *ui = cJSON_CreateObject();
     cJSON_AddStringToObject(ui, "password", "********");
+    // Add a flag if the UI password is still at default
+    const char* default_ui_pw = config_get_default_ui_password();
+    bool ui_password_is_default = (strcmp(config.ui.password, default_ui_pw) == 0);
+    cJSON_AddBoolToObject(ui, "password_is_default", ui_password_is_default);
     cJSON_AddItemToObject(root, "ui", ui);
     // WiFi config
     cJSON *wifi = cJSON_CreateObject();
