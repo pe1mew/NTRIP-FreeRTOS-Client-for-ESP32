@@ -12,6 +12,8 @@ static const char* TAG = "ConfigManager";
 #define NVS_NAMESPACE_NTRIP  "ntrip"
 #define NVS_NAMESPACE_MQTT   "mqtt"
 
+
+
 // Configuration mutex for thread-safe access
 static SemaphoreHandle_t config_mutex = NULL;
 
@@ -702,4 +704,22 @@ bool config_test_ui_password(const char* password) {
         return strcmp(password, default_config.ui.password) == 0;
     }
     return strcmp(password, ui_cfg.password) == 0;
+}
+
+/**
+ * @brief Reset only the UI password to its default value (does not affect other settings).
+ *
+ * Overwrites the UI password in NVS with the default password.
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t config_reset_ui_password(void) {
+    ui_config_t ui_cfg = {0};
+    strncpy(ui_cfg.password, default_config.ui.password, sizeof(ui_cfg.password));
+    esp_err_t err = nvs_save_ui(&ui_cfg);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "UI password reset to default");
+    } else {
+        ESP_LOGE(TAG, "Failed to reset UI password: %s", esp_err_to_name(err));
+    }
+    return err;
 }

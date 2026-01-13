@@ -212,6 +212,14 @@ bool config_test_ui_password(const char* password);
  */
 const char* config_get_default_ui_password(void);
 
+/**
+ * @brief Reset only the UI password to its default value (does not affect other settings).
+ *
+ * Overwrites the UI password in NVS with the default password.
+ * @return ESP_OK on success, error code otherwise
+ */
+esp_err_t config_reset_ui_password(void);
+
 #ifdef __cplusplus
 }
 #endif

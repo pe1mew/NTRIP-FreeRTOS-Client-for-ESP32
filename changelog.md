@@ -19,9 +19,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 - Build error: missing declaration for led_indicator_task_init
+- ButtonBootTask: Added and refactored boot button task for Lolin S3, including long-press detection (5s/10s) and FreeRTOS task structure.
+- Centralized RGB LED control in ledIndicatorTask; RGB LED is now exclusively managed via a FreeRTOS queue.
+- API: led_set_rgb() for inter-task RGB LED commands; button task now sends color commands to indicator task.
+- RGB LED is initialized to off at startup.
+- Doxygen documentation updated for ledIndicatorTask.h.
 
 ### Removed
-- *Nothing.*
+- Button task logic now uses led_set_rgb() and is consistent with other tasks.
+- UI status indicators now update periodically via setInterval in frontend JavaScript.
+- Refactored and cleaned up button and LED indicator task code; removed calculate_system_status_color and related logic.
+- Removed calculate_system_status_color and all related status-based RGB LED logic from ledIndicatorTask.
+
 
 ## [Version x.y.z] - yyyy-mm-dd
 
