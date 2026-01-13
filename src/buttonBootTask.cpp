@@ -52,27 +52,6 @@ esp_err_t initButton(void) {
  * @param pvParameters Task parameters (unused)
  */
 void vButtonTask(void *pvParameters) {
-    // --- Simple feature: RGB LED white when button pressed ---
-    // (Commented out, see restored logic below)
-    // const TickType_t pollDelay = pdMS_TO_TICKS(10);
-    // bool lastButtonState = true;
-    // bool buttonState = true;
-    // (void)pvParameters;
-    // while (1) {
-    //     buttonState = gpio_get_level((gpio_num_t)BUTTON_PIN);
-    //     if (lastButtonState == true && buttonState == false) {
-    //         // Button pressed
-    //         led_set_rgb(255, 255, 255, 0); // White, persistent until released
-    //     }
-    //     if (lastButtonState == false && buttonState == true) {
-    //         // Button released
-    //         led_set_rgb(0, 0, 0, 0); // Off
-    //     }
-    //     lastButtonState = buttonState;
-    //     vTaskDelay(pollDelay);
-    // }
-
-    // --- Restored original logic, adapted to led_set_rgb() ---
     const TickType_t debounceDelay = pdMS_TO_TICKS(50);
     const TickType_t pollDelay = pdMS_TO_TICKS(10);
     const TickType_t fiveSeconds = pdMS_TO_TICKS(5000);
@@ -108,8 +87,14 @@ void vButtonTask(void *pvParameters) {
                 blueSet = true;
             }
             if (!greenSet && pressDuration >= tenSeconds) {
+                // Factory reset and restart
                 led_set_rgb(0, 255, 0, 0); // Green, persistent
                 greenSet = true;
+                ESP_LOGW(TAG, "Button held >10s: Factory reset and restart");
+                vTaskDelay(pdMS_TO_TICKS(500)); // Briefly show green
+                config_factory_reset();
+                vTaskDelay(pdMS_TO_TICKS(200)); // Ensure NVS write
+                esp_restart();
             }
         }
         if (isPressing && buttonState == true && lastButtonState == false) {

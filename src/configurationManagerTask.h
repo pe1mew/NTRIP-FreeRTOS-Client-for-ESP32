@@ -178,10 +178,15 @@ EventGroupHandle_t config_get_event_group(void);
 EventBits_t config_wait_for_event(EventBits_t bits_to_wait_for, TickType_t timeout_ms);
 
 /**
- * @brief Perform factory reset (clear all configuration)
- * 
- * Erases all configuration from NVS and resets to default values
- * 
+ * @brief Perform a factory reset of all configuration.
+ *
+ * This function erases all configuration data from NVS (including UI password, WiFi, NTRIP, MQTT, and any other persisted settings)
+ * and restores all settings to their default values as defined in the firmware.
+ *
+ * After calling this function, the device will use default credentials and network settings on next boot.
+ *
+ * @note This does not restart the device automatically; you should call esp_restart() after factory reset if a reboot is required.
+ *
  * @return ESP_OK on success, error code otherwise
  */
 esp_err_t config_factory_reset(void);
