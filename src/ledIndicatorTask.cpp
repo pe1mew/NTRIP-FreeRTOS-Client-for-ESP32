@@ -14,9 +14,11 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <driver/gpio.h>
+#include <driver/rmt_tx.h>
 #include <esp_log.h>
 #include <string.h>
 #include <sys/time.h>
+#include <freertos/queue.h>
 
 /**
  * @brief Tag for ESP-IDF logging.
@@ -48,6 +50,11 @@ static const char *TAG = "LEDTask";
  * @brief Timeout in seconds to consider activity as stale.
  */
 #define ACTIVITY_TIMEOUT_SEC    2
+/**
+ * @def NUM_LEDS
+ * @brief Number of LEDs in the strip.
+ */
+#define NUM_LEDS        1     // Number of LEDs in the strip
 
 /**
  * @brief LED state enumeration for discrete LEDs.
@@ -91,10 +98,20 @@ typedef struct {
     time_t last_mqtt_activity_time; /**< Last MQTT activity timestamp */
 } led_status_t;
 
-// Global variables
+// RGB LED command structure
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    TickType_t duration_ticks; // 0 = persistent, >0 = temporary
+} rgb_led_cmd_t;
+
 static TaskHandle_t led_task_handle = NULL;
 static time_t last_ntrip_activity = 0;
 static time_t last_mqtt_activity = 0;
+static rmt_channel_handle_t led_channel = NULL;
+static rmt_encoder_handle_t led_encoder = NULL;
+static QueueHandle_t rgb_led_cmd_queue = NULL;
 
 /**
  * @brief Update NTRIP activity timestamp.
@@ -151,39 +168,48 @@ static void init_led_gpios(void) {
 }
 
 /**
- * @brief Initialize Neopixel RGB LED (placeholder, requires led_strip component).
+ * @brief Initialize Neopixel RGB LED using RMT driver.
  */
-static void init_neopixel_led(void) {
-    // Configure STATUS_LED_PIN as output
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << STATUS_LED_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    
-    gpio_config(&io_conf);
-    gpio_set_level(STATUS_LED_PIN, 0); // Turn off initially
-    
-    ESP_LOGI(TAG, "Neopixel GPIO initialized (WS2812 control pending)");
+esp_err_t initRGBLed(void) {
+    rmt_tx_channel_config_t tx_chan_config = {};
+    tx_chan_config.gpio_num = (gpio_num_t)STATUS_LED_PIN;
+    tx_chan_config.clk_src = RMT_CLK_SRC_DEFAULT;
+    tx_chan_config.resolution_hz = 40000000; // 40MHz, 1 tick = 25ns
+    tx_chan_config.mem_block_symbols = 64;
+    tx_chan_config.trans_queue_depth = 4;
+    tx_chan_config.flags.invert_out = false;
+    tx_chan_config.flags.with_dma = false;
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &led_channel));
+    // WS2812B uses GRB format
+    rmt_bytes_encoder_config_t bytes_encoder_config = {};
+    bytes_encoder_config.bit0.level0 = 1;
+    bytes_encoder_config.bit0.duration0 = 14;
+    bytes_encoder_config.bit0.level1 = 0;
+    bytes_encoder_config.bit0.duration1 = 36;
+    bytes_encoder_config.bit1.level0 = 1;
+    bytes_encoder_config.bit1.duration0 = 36;
+    bytes_encoder_config.bit1.level1 = 0;
+    bytes_encoder_config.bit1.duration1 = 14;
+    bytes_encoder_config.flags.msb_first = 1;
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&bytes_encoder_config, &led_encoder));
+    ESP_ERROR_CHECK(rmt_enable(led_channel));
+    ESP_LOGI(TAG, "LED strip initialized on GPIO %d", STATUS_LED_PIN);
+    return ESP_OK;
 }
 
 /**
- * @brief Update Neopixel with the given RGB color (placeholder).
+ * @brief Set the color of the RGB LED.
  *
- * @param color RGB color to set.
- *
- * @note Actual WS2812 control is not implemented; pin is used as a simple on/off indicator.
+ * @param red Red component (0-255).
+ * @param green Green component (0-255).
+ * @param blue Blue component (0-255).
  */
-static void update_neopixel(rgb_color_t color) {
-    // TODO: Implement WS2812 control via RMT when led_strip component is available
-    // For now, just use the pin as a simple on/off indicator
-    if (color.r > 0 || color.g > 0 || color.b > 0) {
-        gpio_set_level(STATUS_LED_PIN, 1); // On
-    } else {
-        gpio_set_level(STATUS_LED_PIN, 0); // Off
-    }
+void set_led_color(uint8_t red, uint8_t green, uint8_t blue) {
+    uint8_t led_data[3] = {green, red, blue};
+    rmt_transmit_config_t tx_config = {};
+    tx_config.loop_count = 0;
+    ESP_ERROR_CHECK(rmt_transmit(led_channel, led_encoder, led_data, sizeof(led_data), &tx_config));
+    rmt_tx_wait_all_done(led_channel, portMAX_DELAY);
 }
 
 /**
@@ -242,32 +268,6 @@ static bool calculate_rtk_float_led_state(const led_status_t *status, bool blink
 }
 
 /**
- * @brief Calculate system status color for Neopixel.
- *
- * @param status Pointer to current LED status structure.
- * @return RGB color representing system status.
- */
-static rgb_color_t calculate_system_status_color(const led_status_t *status) {
-    // RED: Critical error (no WiFi STA and no valid GPS data)
-    if (!status->wifi_sta_connected && !status->gps_data_valid) {
-        return RGB_RED;
-    }
-    
-    // YELLOW: Partial operation (WiFi connected but services not running optimally)
-    if (!status->wifi_sta_connected || (!status->ntrip_connected && !status->gps_data_valid)) {
-        return RGB_YELLOW;
-    }
-    
-    // GREEN: Full operation (WiFi connected, GPS valid, NTRIP connected)
-    if (status->wifi_sta_connected && status->gps_data_valid && status->ntrip_connected) {
-        return RGB_GREEN;
-    }
-    
-    // YELLOW: Default partial operation state
-    return RGB_YELLOW;
-}
-
-/**
  * @brief LED Indicator Task main loop.
  *
  * This FreeRTOS task manages all status LEDs and updates them based on system state.
@@ -288,14 +288,32 @@ static void led_indicator_task(void *pvParameters) {
     };
     uint32_t blink_counter = 0;
     bool blink_state = false;
+    rgb_color_t override_rgb = {0, 0, 0};
+    TickType_t override_until = 0;
     
     ESP_LOGI(TAG, "LED Indicator Task started");
     
     // Initialize LEDs
     init_led_gpios();
-    init_neopixel_led();
+    initRGBLed();
+    // Set RGB LED to off at startup
+    set_led_color(0, 0, 0);
     
     while (1) {
+        // Check for RGB LED command
+        rgb_led_cmd_t cmd;
+        if (rgb_led_cmd_queue && xQueueReceive(rgb_led_cmd_queue, &cmd, 0)) {
+            override_rgb.r = cmd.r;
+            override_rgb.g = cmd.g;
+            override_rgb.b = cmd.b;
+            if (cmd.duration_ticks > 0) {
+                override_until = xTaskGetTickCount() + cmd.duration_ticks;
+            } else {
+                override_until = 0xFFFFFFFF;
+            }
+            set_led_color(override_rgb.r, override_rgb.g, override_rgb.b);
+        }
+        
         // Update blink counter (toggles every 500ms for 1 Hz blink)
         blink_counter++;
         if (blink_counter >= (LED_BLINK_PERIOD_MS / LED_UPDATE_RATE_MS)) {
@@ -334,8 +352,12 @@ static void led_indicator_task(void *pvParameters) {
         gpio_set_level(FIX_RTKFLOAT_LED, calculate_rtk_float_led_state(&status, blink_state) ? 1 : 0);
         
         // Update Neopixel RGB LED
-        rgb_color_t rgb = calculate_system_status_color(&status);
-        update_neopixel(rgb);
+        if (override_until && xTaskGetTickCount() < override_until) {
+            set_led_color(override_rgb.r, override_rgb.g, override_rgb.b);
+        } else {
+            override_until = 0;
+            // set_led_color or other logic can be placed here if needed
+        }
         
         // Delay for update rate
         vTaskDelay(pdMS_TO_TICKS(LED_UPDATE_RATE_MS));
@@ -348,7 +370,11 @@ static void led_indicator_task(void *pvParameters) {
  * This function creates the FreeRTOS task that manages all status LEDs.
  */
 void led_indicator_task_init(void) {
+    // Create RGB LED command queue
+    rgb_led_cmd_queue = xQueueCreate(4, sizeof(rgb_led_cmd_t));
     // Create task
+    initRGBLed(); // Initialize RGB LED RMT driver
+    set_led_color(0, 0, 0); // Set RGB LED to off at initialization
     BaseType_t result = xTaskCreate(
         led_indicator_task,
         "led_indicator",
@@ -357,9 +383,16 @@ void led_indicator_task_init(void) {
         LED_TASK_PRIORITY,
         &led_task_handle
     );
-    
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Failed to create LED Indicator Task");
+    }
+}
+
+// API for other tasks to send RGB LED command
+void led_set_rgb(uint8_t r, uint8_t g, uint8_t b, TickType_t duration_ticks) {
+    if (rgb_led_cmd_queue) {
+        rgb_led_cmd_t cmd = { r, g, b, duration_ticks };
+        xQueueSend(rgb_led_cmd_queue, &cmd, 0);
     }
 }
 

@@ -482,6 +482,8 @@ static const char* html_page =
 "                showConnectionLostPopup();\n"
 "            });\n"
 "        }\n"
+"        // Periodically update status every 5 seconds\n"
+"        setInterval(updateStatus, 5000);\n"
 "        // --- Initial auth check ---\n"
 "        if (localStorage.getItem('session_token')) {\n"
 "            showMain();\n"

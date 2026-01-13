@@ -13,6 +13,7 @@
 #include "mqttClientTask.h"
 
 #include "ledIndicatorTask.h"
+#include "buttonBootTask.h"
 
 static const char *TAG = "MAIN";
 
@@ -112,6 +113,16 @@ extern "C" void app_main(void) {
         ESP_LOGW(TAG, "MQTT Client Task initialization failed or disabled: %s", esp_err_to_name(ret));
     } else {
         ESP_LOGI(TAG, "✓ MQTT Client Task initialized");
+    }
+    
+    // ========================================
+    // Step 11: Initialize Button Boot Task
+    // ========================================
+    ret = button_boot_task_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize Button Boot Task: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "\u2713 Button Boot Task initialized");
     }
     
     // ========================================
