@@ -94,10 +94,10 @@ Browser <-up-> HTTPServer : "HTTP 192.168.4.1\nREST API"
 
 note right of NVS
   Persistent storage:
-  - WiFi credentials
+  - WiFi credentials (STA + AP)
   - NTRIP config
   - MQTT config
-  - Admin password
+  - UI password (hashed)
 end note
 
 note right of rtcm_queue
@@ -109,7 +109,7 @@ end note
 note right of gga_queue
   Non-blocking queue
   Overwrite if full
-  Size: 1-2 items
+  Size: 5 items
 end note
 
 note bottom of WiFi
@@ -173,6 +173,7 @@ Configuration Manager (config.h/cpp):
 	typedef struct {
 		char ssid[32];
 		char password[64];
+		char ap_password[64];     // AP mode password (default: "12345678")
 	} wifi_config_t;
 	
 	typedef struct {
@@ -183,7 +184,7 @@ Configuration Manager (config.h/cpp):
 		char password[64];
 		uint16_t gga_interval_sec;     // Default: 120
 		uint16_t reconnect_delay_sec;  // Default: 5
-		bool enabled;                  // Default: true
+		bool enabled;                  // Default: false (disabled by default)
 	} ntrip_config_t;
 	
 	typedef struct {
@@ -195,7 +196,7 @@ Configuration Manager (config.h/cpp):
 		uint16_t gnss_interval_sec;    // Default: 10
 		uint16_t status_interval_sec;  // Default: 120
 		uint16_t stats_interval_sec;   // Default: 60
-		bool enabled;                  // Default: true
+		bool enabled;                  // Default: false (disabled by default)
 	} mqtt_config_t;
 	
 	typedef struct {
@@ -210,7 +211,8 @@ JSON Configuration Format:
 	{
 		"wifi": {
 			"ssid": "ssid",
-			"password": "wifi_password"
+			"password": "wifi_password",
+			"ap_password": "ap_wifi_password"
 		},
 		"ntrip": {
 			"host": "host",
@@ -220,7 +222,7 @@ JSON Configuration Format:
 			"password": "ntrip_user_password",
 			"gga_interval_sec": 120,
 			"reconnect_delay_sec": 5,
-			"enabled": true
+			"enabled": false
 		},
 		"mqtt": {
 			"broker": "broker",
@@ -231,7 +233,7 @@ JSON Configuration Format:
 			"gnss_interval_sec": 10,
 			"status_interval_sec": 120,
 			"stats_interval_sec": 60,
-			"enabled": true
+			"enabled": false
 		}
 	}
 	```
@@ -247,9 +249,9 @@ Event Notifications:
  - When config changes via web, notify affected tasks
  - Tasks can reinitialize/reconnect as needed
  - **Task Restart Capability**: NTRIP Client, MQTT Client, and Data Output Task monitor configuration changes and can be:
-   - **Disabled/Enabled**: Set `enabled` flag to false to stop task operation
+   - **Disabled/Enabled**: Set `enabled` flag to false to stop task operation, or use runtime toggle via `/api/toggle` endpoint
    - **Restarted**: When configuration parameters change, tasks automatically disconnect and reconnect with new settings
-   - **Default State**: All tasks enabled by default
+   - **Default State**: NTRIP and MQTT are disabled by default to prevent connection attempts without user configuration
 
 # 3. Technology Stack
 
@@ -258,8 +260,11 @@ Event Notifications:
 The ESP32 will operate in **AP+STA (Access Point + Station) mode simultaneously**:
 
 ### Access Point (AP) Mode:
- - **SSID**: "ESP32-Config" (or customizable)
- - **Password**: WPA2-PSK protected
+ - **SSID**: "NTRIPClient-XXXX" (where XXXX = last 4 hex digits of MAC address)
+   - Example: "NTRIPClient-A3F2" for MAC address ending in ...A3:F2
+   - Ensures unique SSID for each device, preventing conflicts in multi-device deployments
+   - SSID is read-only in web UI (not user-configurable)
+ - **Password**: WPA2-PSK protected (configurable via `ap_password` in WiFi config)
  - **IP Address**: 192.168.4.1 (default gateway)
  - **Purpose**: Always-accessible configuration interface
  - **Max Connections**: 4 concurrent clients
@@ -272,11 +277,12 @@ The ESP32 will operate in **AP+STA (Access Point + Station) mode simultaneously*
 
 ### Configuration Flow:
 ```
-1. User connects device to "ESP32-Config" WiFi (192.168.4.1)
-2. Access web interface to configure WiFi credentials
-3. ESP32 connects to user's router (STA) while keeping AP active
-4. Configuration always accessible via AP (192.168.4.1)
-5. Internet services run through STA connection
+1. User connects device to "NTRIPClient-XXXX" WiFi (192.168.4.1)
+2. User authenticates with UI password (default: "admin")
+3. Access web interface to configure WiFi credentials
+4. ESP32 connects to user's router (STA) while keeping AP active
+5. Configuration always accessible via AP (192.168.4.1)
+6. Internet services run through STA connection
 ```
 
 ### Technical Details:
@@ -309,6 +315,40 @@ httpd_start(&server, &config);
 | GET | `/favicon.ico` | Browser icon | image/x-icon |
 
 ### REST API Endpoints:
+
+#### Authentication:
+
+**POST /api/login**
+- **Purpose**: Authenticate user with UI password and obtain session token
+- **Content-Type**: application/json
+- **Request Body**:
+```json
+{
+    "password": "admin"
+}
+```
+- **Response Codes**:
+  - `200 OK`: Authentication successful
+  - `401 Unauthorized`: Invalid password
+- **Example Success Response**:
+```json
+{
+    "status": "ok",
+    "token": "a1b2c3d4e5f6..."
+}
+```
+- **Example Error Response**:
+```json
+{
+    "status": "error",
+    "message": "Invalid password"
+}
+```
+- **Session Management**:
+  - Session token returned in response and must be included in subsequent requests
+  - Token sent via `Authorization: Bearer <token>` header or stored in cookie
+  - Default password: "admin" (configurable via web UI)
+  - Password stored hashed in NVS
 
 #### Configuration Management:
 
@@ -431,35 +471,78 @@ httpd_start(&server, &config);
 }
 ```
 
+**POST /api/toggle**
+- **Purpose**: Enable or disable NTRIP/MQTT services at runtime without restarting device
+- **Content-Type**: application/json
+- **Request Body**:
+```json
+{
+    "service": "ntrip",
+    "enabled": true
+}
+```
+- **Parameters**:
+  - `service`: "ntrip" or "mqtt"
+  - `enabled`: true or false
+- **Response Codes**:
+  - `200 OK`: Service toggled successfully
+  - `400 Bad Request`: Invalid service name or missing parameters
+- **Example Success Response**:
+```json
+{
+    "status": "ok",
+    "message": "NTRIP service enabled"
+}
+```
+- **Example Error Response**:
+```json
+{
+    "status": "error",
+    "message": "Invalid service name"
+}
+```
+- **Behavior**:
+  - Immediately starts or stops the specified service
+  - Updates configuration in NVS for persistence across reboots
+  - No device restart required
+
 ### Web Interface Implementation:
 
 **User Workflow**:
 ```
 1. User opens browser → http://192.168.4.1
-2. ESP32 serves HTML configuration form
-3. JavaScript loads current config via GET /api/config
-4. User modifies WiFi/MQTT/NTRIP settings in form
-5. JavaScript validates input client-side
-6. JavaScript POSTs to /api/config with JSON data
-7. ESP32 validates, saves to NVS, notifies affected tasks
-8. JavaScript displays success/error message
-9. Page polls /api/status for real-time connection updates
+2. ESP32 serves HTML login page
+3. User enters UI password (default: "admin")
+4. JavaScript POSTs to /api/login for authentication
+5. On success, receives session token and stores in cookie
+6. JavaScript loads current config via GET /api/config (with session token)
+7. User modifies WiFi/MQTT/NTRIP settings in form
+8. User can toggle NTRIP/MQTT on/off via runtime toggle switches
+9. JavaScript validates input client-side
+10. JavaScript POSTs to /api/config with JSON data (with session token)
+11. ESP32 validates, saves to NVS, notifies affected tasks
+12. JavaScript displays success/error message
+13. Page polls /api/status for real-time connection updates
 ```
 
 ### HTTP Handler Registration:
 
 ### Security Considerations:
 
- - **HTTP Basic Authentication**: Required for all configuration endpoints
-   - **Default Credentials**: Username: `admin`, Password: `admin`
-   - **Configurable**: Credentials can be changed via web interface
-   - **Storage**: Hashed password stored in NVS
-   - **Protected Endpoints**: `/api/config` (POST), `/api/restart`, `/api/factory_reset`
-   - **Public Endpoints**: `/` (login page), `/api/status` (read-only)
-   - **Implementation**: ESP-IDF httpd basic auth or custom middleware
-   - **Header Format**: `Authorization: Basic base64(username:password)`
-   - **Failed Attempts**: Log failed authentication attempts
-   - **Security Warning**: Users must change default credentials on first use
+ - **Session-Based Authentication**: Required for all configuration endpoints
+   - **Default Password**: `admin` (user-configurable via web UI)
+   - **UI Password**: Separate from WiFi AP password, used only for web interface access
+   - **Password Recovery**: Button Boot Task allows password reset by holding GPIO 0 button for 5 seconds
+     - Resets UI password to default "admin"
+     - Device logs "Password reset to default" message
+     - RGB LED indicates reset in progress
+   - **Storage**: Hashed password stored in NVS under `ui_password` key
+   - **Session Tokens**: Generated on successful login, validated on subsequent requests
+   - **Protected Endpoints**: `/api/config` (POST/GET), `/api/restart`, `/api/factory_reset`, `/api/toggle`
+   - **Public Endpoints**: `/` (login page), `/api/login` (authentication)
+   - **Token Format**: Bearer token sent via `Authorization: Bearer <token>` header or cookie
+   - **Failed Attempts**: Log failed authentication attempts for security monitoring
+   - **Security Warning**: Users should change default password on first use
  - **Password Masking**: Passwords returned as "********" in GET /api/config requests
  - **Input Validation**: All inputs validated before saving to NVS
  - **CORS**: Not required (same-origin policy applies)
@@ -546,6 +629,7 @@ Security:
  - **NTRIP Client Task**: Streaming protocol requires persistent connection
  - **GNSS Receiver Task**: Handles bidirectional GPS communication
  - **Data Output Task**: Formats and transmits telemetry data
+ - **Button Boot Task**: Monitors GPIO 0 for UI password reset functionality
 
 ### Task Detailed Specifications:
 
@@ -555,8 +639,9 @@ Security:
 
 **Purpose**: Establish and maintain persistent connection to NTRIP caster to receive RTCM correction data for RTK positioning.
 
-**Runtime Control**: 
-- **Enabled by default** - can be disabled via configuration (`enabled` flag)
+**Runtime Control**:
+- **Disabled by default** - must be enabled via configuration (`enabled` flag) or runtime toggle
+- **Runtime toggle** - can be enabled/disabled via `/api/toggle` endpoint without device restart
 - **Automatic restart** - when configuration changes, task disconnects and reconnects with new settings
 - **Graceful shutdown** - when disabled, cleanly closes connection and stops operation
 
@@ -631,7 +716,7 @@ Content-Type: gnss/data
   
 - **gga_queue** (input): Receives GGA sentences from GNSS Receiver Task
   - Type: `char[128]`
-  - Size: 2 items
+  - Size: 5 items
   - Blocking: **No** - Overwrite if full
   - Strategy: Only latest GGA position needed for caster updates
 
@@ -748,10 +833,10 @@ The current `NTRIPClient` code uses Arduino framework and requires porting to ES
 
 **Purpose**: Format and transmit telemetry data (position, time, navigation) to external telemetry unit.
 
-**Runtime Control**: 
-- **Enabled by default** - can be disabled via configuration (`enabled` flag)
-- **Automatic restart** - when configuration changes (e.g., output interval), task restarts with new settings
-- **Graceful shutdown** - when disabled, stops transmission cleanly
+**Runtime Control**:
+- **Enabled by default** - always runs to provide telemetry output
+- **Not user-configurable** - runs continuously as core system function
+- **No runtime toggle** - unlike NTRIP/MQTT, this task cannot be disabled via web UI
 
 ### Configuration:
 - **UART Port**: UART1 (Serial1)
@@ -977,6 +1062,150 @@ Use ESP-IDF component `led_strip` for Neopixel control:
 #define GPS_FIX_MANUAL     7  // Manual input mode
 #define GPS_FIX_SIMULATION 8  // Simulation mode
 ```
+
+---
+
+## Button Boot Task
+
+**Purpose**: Monitor GPIO 0 boot button for user-initiated password reset to recover access to web interface when UI password is forgotten.
+
+**Runtime Control**:
+- **Always enabled** - provides critical password recovery functionality
+- **No configuration needed** - operates autonomously monitoring button state
+- **System-level task** - runs independently of other service configurations
+
+### Configuration:
+- **GPIO Pin**: GPIO 0 (Boot button on ESP32-S3 DevKit)
+- **Pull-up**: Internal pull-up resistor enabled
+- **Active State**: LOW (button pressed = GPIO LOW)
+- **Hold Duration**: 5 seconds (5000 ms)
+- **Debounce**: 50 ms
+- **Task Priority**: 3 (higher than monitoring tasks, lower than critical communication)
+- **Stack Size**: 2048 bytes
+- **Poll Rate**: 100 ms (10 Hz)
+
+### Responsibilities:
+
+**Button Monitoring**:
+1. Continuously monitor GPIO 0 button state every 100ms
+2. Detect button press (transition from HIGH to LOW)
+3. Debounce button input to prevent false triggers (50ms stable state required)
+4. Track hold duration while button remains pressed
+5. Ignore short presses (less than 5 seconds)
+
+**Password Reset Trigger**:
+1. When button held for 5 consecutive seconds:
+   - Reset UI password to default "admin"
+   - Update NVS with new hashed password
+   - Log "Password reset to default" message
+   - Provide visual feedback via RGB LED (pulsing blue or white)
+   - Continue monitoring after reset (no device restart required)
+
+**User Feedback**:
+1. **Button pressed < 5 seconds**: No action, release ignored
+2. **Button held for 5 seconds**:
+   - RGB LED changes color (e.g., pulsing white/blue) to indicate reset
+   - Password reset immediately
+   - LED returns to normal status indication
+3. **Button released**: Return to normal monitoring state
+
+### Implementation Notes:
+- Use `gpio_get_level(GPIO_NUM_0)` to read button state
+- Track press start time using `esp_timer_get_time()` or FreeRTOS tick count
+- Reset only affects UI password, not WiFi credentials or service configurations
+- No device restart required after password reset
+- Consider adding audible feedback if buzzer available (future enhancement)
+- Log all password reset events with timestamp for security audit trail
+- Optional: Flash all LEDs briefly to confirm reset action
+
+### Data Structures:
+
+```c
+typedef struct {
+    uint32_t press_start_ms;     // Timestamp when button pressed
+    bool button_pressed;         // Current button state
+    bool reset_triggered;        // Prevent multiple resets during single press
+} button_state_t;
+```
+
+### Task Loop Structure:
+
+```c
+void button_boot_task(void *pvParameters) {
+    button_state_t state = {0};
+
+    // Configure GPIO 0 with pull-up
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_0),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    while (1) {
+        int button_level = gpio_get_level(GPIO_NUM_0);
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+        if (button_level == 0) {  // Button pressed (active LOW)
+            if (!state.button_pressed) {
+                // Button just pressed
+                state.button_pressed = true;
+                state.press_start_ms = current_time;
+                state.reset_triggered = false;
+            } else {
+                // Button held, check duration
+                uint32_t hold_duration = current_time - state.press_start_ms;
+                if (hold_duration >= 5000 && !state.reset_triggered) {
+                    // Trigger password reset
+                    reset_ui_password_to_default();
+                    state.reset_triggered = true;
+                    ESP_LOGW("ButtonBoot", "UI password reset to default");
+                    // Optional: Visual feedback via LED
+                }
+            }
+        } else {
+            // Button released
+            state.button_pressed = false;
+            state.reset_triggered = false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));  // 100ms poll rate
+    }
+}
+```
+
+### Password Reset Function:
+
+```c
+void reset_ui_password_to_default(void) {
+    const char *default_password = "admin";
+
+    // Hash password before storing
+    char hashed_password[64];
+    hash_password(default_password, hashed_password, sizeof(hashed_password));
+
+    // Save to NVS
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("config", NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        nvs_set_str(nvs_handle, "ui_password", hashed_password);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        ESP_LOGI("ButtonBoot", "UI password reset successful");
+    } else {
+        ESP_LOGE("ButtonBoot", "Failed to open NVS for password reset");
+    }
+}
+```
+
+### Security Considerations:
+- Physical access to device required (button on device)
+- Resets only UI password, not configuration data
+- All reset events logged with timestamp
+- Consider rate limiting (e.g., only allow reset once every 60 seconds)
+- Optional: Require device restart after reset for added security
 
 ---
 
@@ -1311,8 +1540,9 @@ typedef struct {
 
 **Purpose**: Publish real-time GPS position, fix quality, and navigation data to MQTT broker for remote monitoring, data logging, and integration with telemetry systems.
 
-**Runtime Control**: 
-- **Enabled by default** - can be disabled via configuration (`enabled` flag)
+**Runtime Control**:
+- **Disabled by default** - must be enabled via configuration (`enabled` flag) or runtime toggle
+- **Runtime toggle** - can be enabled/disabled via `/api/toggle` endpoint without device restart
 - **Automatic restart** - when configuration changes, task disconnects and reconnects with new settings
 - **Graceful shutdown** - when disabled, cleanly disconnects from broker and stops operation
 
