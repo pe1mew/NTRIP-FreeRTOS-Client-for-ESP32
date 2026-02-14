@@ -14,12 +14,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 - All sensitive backend API endpoints now require authentication via session token (Authorization: Bearer ... header).
 - Logout button added to the bottom of the main UI for easy session termination.
 - Doxygen-compatible documentation for all major headers: gnssReceiverTask.h, dataOutputTask.h, configurationManagerTask.h, NMEAParser.h, statisticsTask.h.
+- HTTP Server Security Analysis document (HTTPServerSecurityAnalysis.md) documenting authentication mechanisms, external API access methods, security vulnerabilities, and recommended improvements.
 
 ### Changed
 - Telemetry output now includes GNSS fix quality indicator before CRC-16
 - Improved documentation for config_factory_reset to clarify NVS erase and restart requirements.
 - Refactored statisticsTask.h to document all fields and structures for Doxygen.
 - Updated frontend JavaScript to decouple connection lost popup from login/logout logic.
+- Design document updated to reflect actual implementation including AP SSID format (NTRIPClient-XXXX with MAC address suffix), session-based authentication, runtime service toggle endpoints, Button Boot Task section, queue sizes, and default states.
+- UI Manual updated throughout to reference correct AP SSID format (NTRIPClient-XXXX where XXXX = last 4 hex digits of MAC address) in all sections including initial setup, network architecture, WiFi configuration, troubleshooting, and quick reference.
 
 ### Fixed
 - Build error: missing declaration for led_indicator_task_init
