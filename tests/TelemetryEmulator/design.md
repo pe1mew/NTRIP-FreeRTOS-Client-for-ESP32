@@ -1,7 +1,7 @@
 # TelemetryEmulator — Design Document
 
 **Module:** `tests/TelemetryEmulator`
-**Version:** 2.0
+**Version:** 4.0
 **Date:** 2026-03-22
 **Author:** NTRIP FreeRTOS Client Project
 
@@ -9,7 +9,11 @@
 
 ## 1. Purpose & Scope
 
-The TelemetryEmulator is a standalone ESP32-S3 (LOLIN S3) firmware application that acts as a **receiver** for the binary telemetry stream produced by the NTRIP Client firmware running on a second LOLIN S3 board. The two boards are connected by a direct UART wire. The TelemetryEmulator decodes incoming frames, validates the CRC-16 checksum, and reports any CRC errors to the debug console via `ESP_LOGE`.
+The TelemetryEmulator is a standalone ESP32-S3 (LOLIN S3) firmware application that runs two independent FreeRTOS tasks:
+
+1. **`telemetryReceiverTask`** — acts as a **receiver** for the binary telemetry stream produced by the NTRIP Client firmware running on a second LOLIN S3 board. The two boards are connected by a direct UART wire. The task decodes incoming frames, validates the CRC-16 checksum, and reports any CRC errors to the debug console via `ESP_LOGE`.
+
+2. **`sensorEmulatorTask`** — generates a deterministic JSON telemetry packet every 1 second, wraps it in the same SOH/DLE-stuffed/CRC-16/CAN binary frame format used by the NTRIP Client, and transmits it over UART1 TX (GPIO4). Each JSON field is driven by a periodic waveform (sine, cosine, triangle, square, trapezoid, or rectified sine) scaled to the min/max range specified by the MQTT interface in `sensorData.md`. Because the output is protocol-compatible with the receiver, GPIO4 TX can be wired to GPIO5 RX for a self-contained loopback test that exercises the full encode → decode → CRC-validate chain on a single board.
 
 ### Goals
 
@@ -17,12 +21,15 @@ The TelemetryEmulator is a standalone ESP32-S3 (LOLIN S3) firmware application t
 - Decode the binary framing protocol (byte de-stuffing, SOH/CAN boundary detection)
 - Validate each frame's CRC-16 checksum and report failures via `ESP_LOGE`
 - Log successfully decoded payloads via `ESP_LOGI` for visual confirmation
-- Run as a FreeRTOS task, consistent with the architecture of the main project
+- Generate deterministic JSON telemetry packets every 1 second with signal values driven by periodic waveforms (sine, cosine, triangle, square, trapezoid, |sine|)
+- Encode each packet as a binary frame (SOH + byte-stuffed payload + stuffed CRC-16 + CAN) identical to the format received by `telemetryReceiverTask`
+- Transmit binary-framed packets over UART1 TX (GPIO4, 115200 baud)
+- Support a single-board loopback test by connecting GPIO4 TX → GPIO5 RX
+- Run both functions as independent FreeRTOS tasks, consistent with the architecture of the main project
 
 ### Non-Goals
 
 - Does **not** act as an NTRIP client — it only processes telemetry frames
-- Does **not** produce outgoing telemetry frames
 - Does **not** run a WiFi stack, HTTP server, or MQTT client
 - Does **not** replace the host-side unit tests in `tests/NMEAparser/` or `tests/CRC16/`
 
@@ -44,28 +51,33 @@ The `dataOutputTask` on the **NTRIP Client** ESP32-S3 transmits binary-framed po
                                            │  115200 baud 8N1
                     Physical wire          │
                                            ▼
-┌────────────────────────────────────────────┐
-│  TelemetryEmulator — LOLIN S3 #2           │
-│                                            │
-│   GPIO5 RX ← UART1                         │
-│   telemetryReceiverTask                    │
-│   → decode frame                           │
-│   → validate CRC-16                        │
-│   → ESP_LOGI (ok) / ESP_LOGE (CRC fail)    │
-└────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  TelemetryEmulator — LOLIN S3 #2                    │
+│                                                     │
+│   GPIO5 RX ← UART1   telemetryReceiverTask          │
+│                        → decode frame               │
+│                        → validate CRC-16            │
+│                        → ESP_LOGI / ESP_LOGE        │
+│                                                     │
+│   UART1 TX → GPIO4    sensorEmulatorTask            │
+│                        → waveform-driven signals    │
+│                        → JSON payload every 1 s     │
+│                        → binary framed (SOH…CAN)    │
+└─────────────────────────────────────────────────────┘
 
-Shared: GND ─────────────────────────────────
+Shared: GND ──────────────────────────────────────────
 ```
 
 ### 2.2 Hardware Wiring
 
-| Signal | NTRIP Client (LOLIN S3 #1) | TelemetryEmulator (LOLIN S3 #2) |
-|--------|---------------------------|----------------------------------|
-| UART TX | GPIO15 (UART1 TX) | — |
-| UART RX | — | GPIO5 (UART1 RX) |
-| GND | GND | GND |
+| Signal | NTRIP Client (LOLIN S3 #1) | TelemetryEmulator (LOLIN S3 #2) | Direction |
+|--------|---------------------------|----------------------------------|----------|
+| UART1 TX | GPIO15 (UART1 TX) | — | Client → Emulator |
+| UART1 RX | — | GPIO5 (UART1 RX) | Client → Emulator |
+| UART1 TX | — | GPIO4 (UART1 TX) | Emulator → consumer |
+| GND | GND | GND | shared |
 
-> **Note:** Only a single wire + GND is required. The link is unidirectional (transmit only from the NTRIP Client).
+> **Note:** The TelemetryEmulator uses a single UART peripheral (UART1) for both tasks. `telemetryReceiverTask` reads on the RX wire (GPIO5 ← NTRIP Client GPIO15) and `sensorEmulatorTask` writes on the TX wire (GPIO4 → serial terminal / test harness). The two wires are electrically independent.
 
 ### 2.3 Relationship to Other Modules
 
@@ -80,9 +92,11 @@ tests/
     ├── sdkconfig.defaults    ← Minimal ESP-IDF config
     ├── main/
     │   ├── CMakeLists.txt
-    │   ├── main.cpp          ← app_main()
+    │   ├── main.cpp                  ← app_main()
     │   ├── telemetryReceiverTask.h
-    │   └── telemetryReceiverTask.cpp
+    │   ├── telemetryReceiverTask.cpp
+    │   ├── sensorEmulatorTask.h
+    │   └── sensorEmulatorTask.cpp
     └── components/
         └── crc16/            ← Shared CRC-16 (sourced from src/lib/CRC16)
             ├── CMakeLists.txt
@@ -192,8 +206,9 @@ YYYY-MM-DD HH:mm:ss.sss,LAT,LON,ALT,HEADING,SPEED,FIXQ
 
 | Component | File(s) | Responsibility |
 |-----------|---------|----------------|
-| **Application entry** | `main/main.cpp` | `app_main()`: UART init, task creation |
-| **Receiver task** | `main/telemetryReceiverTask.h/.cpp` | FreeRTOS task, frame state machine, CRC validation, `ESP_LOG` reporting |
+| **Application entry** | `main/main.cpp` | `app_main()`: UART1 init (RX=GPIO5, TX=GPIO4, with TX ring buffer), task creation |
+| **Receiver task** | `main/telemetryReceiverTask.h/.cpp` | FreeRTOS task, frame state machine, CRC validation, `ESP_LOG` reporting — uses UART1 RX |
+| **Sensor emulator task** | `main/sensorEmulatorTask.h/.cpp` | FreeRTOS task, deterministic waveform generation, JSON serialisation, UART1 TX output at 1 Hz |
 | **CRC-16** | `components/crc16/CRC16.h/.cpp` | Shared CRC-16-CCITT-FALSE calculation (sourced from `src/lib/CRC16`) |
 
 ### 4.2 Component Diagram (PlantUML)
@@ -211,7 +226,7 @@ skinparam component {
 
 package "TelemetryEmulator Firmware — LOLIN S3 #2" {
 
-    component [app_main()\ninitialise UART\ncreate task] as Main <<task>>
+    component [app_main()\ninitialise UART1 & UART2\ncreate tasks] as Main <<task>>
 
     component [telemetryReceiverTask\n(FreeRTOS task)] as RecvTask <<task>>
     note right of RecvTask
@@ -225,19 +240,38 @@ package "TelemetryEmulator Firmware — LOLIN S3 #2" {
         ESP_LOGI / ESP_LOGE
     end note
 
+    component [sensorEmulatorTask\n(FreeRTOS task)] as EmulTask <<task>>
+    note left of EmulTask
+      1 Hz timer
+      waveform generators:
+        sine, cosine, triangle
+        square, trapezoid, |sine|
+      JSON serialise
+      CRC-16 compute
+      byte-stuff + frame
+      uart_write_bytes(UART1 TX)
+    end note
+
     component [CRC-16\n(calculateCRC16)] as CRC16 <<util>>
 
-    component [ESP-IDF UART Driver\n(UART1, 115200 8N1)] as UART <<io>>
+    component [ESP-IDF UART1 Driver\n(115200 8N1, RX=GPIO5)] as UART1 <<io>>
 
-    Main --> RecvTask : xTaskCreate()
-    RecvTask --> UART   : uart_read_bytes()
+    component [ESP-IDF UART2 Driver\n(115200 8N1, TX=GPIO17)] as UART2 <<io>>
+
+    Main --> RecvTask  : xTaskCreate()
+    Main --> EmulTask  : xTaskCreate()
+    RecvTask --> UART1  : uart_read_bytes()
     RecvTask --> CRC16  : calculateCRC16(payload, len)
     RecvTask --> RecvTask : ESP_LOGI / ESP_LOGE
+    EmulTask --> UART2  : uart_write_bytes(json, len)
+    EmulTask --> EmulTask : ESP_LOGI
 }
 
 component [NTRIP Client LOLIN S3\n(dataOutputTask)] as NTRIPBoard <<external>>
+component [Serial terminal /\ntest harness] as Consumer <<external>>
 
-NTRIPBoard --> UART : GPIO15 TX → GPIO5 RX\n115200 baud 8N1
+NTRIPBoard --> UART1 : GPIO15 TX → GPIO5 RX\n115200 baud 8N1
+UART2 --> Consumer : GPIO17 TX\n115200 baud 8N1, JSON lines
 
 @enduml
 ```
@@ -318,9 +352,9 @@ end
 ### 5.1 `app_main()` — `main/main.cpp`
 
 Responsibilities:
-1. Configure UART1 (`UART_NUM_1`, 115200 baud, 8N1, RX=GPIO5)
-2. Install the ESP-IDF UART driver with a 1024-byte RX ring buffer
-3. Call `telemetry_receiver_task_init()` to create the FreeRTOS task
+1. Configure and install UART1 (`UART_NUM_1`, 115200 baud, 8N1, RX=GPIO5, TX=GPIO4) with a 1024-byte RX ring buffer and a 512-byte TX ring buffer
+2. Call `telemetry_receiver_task_init()` to create the telemetry receiver FreeRTOS task
+3. Call `sensor_emulator_task_init()` to create the sensor emulator FreeRTOS task (no UART setup — reuses UART1)
 4. Return (the task scheduler takes over)
 
 ### 5.2 `telemetryReceiverTask` — `main/telemetryReceiverTask.h/.cpp`
@@ -372,7 +406,94 @@ typedef enum {
 
 Statistics are logged via `ESP_LOGI` every 100 frames.
 
-### 5.3 CRC-16 Component — `components/crc16/`
+### 5.3 `sensorEmulatorTask` — `main/sensorEmulatorTask.h/.cpp`
+
+**Public API:**
+
+```c
+/**
+ * @brief Initialise and start the Sensor Emulator Task.
+ *
+ * Assumes UART1 has already been configured by app_main() with TX=GPIO4.
+ * Transmits one binary-framed JSON telemetry packet per second over
+ * UART1 TX (GPIO4, 115200 8N1).  Frame format is identical to the
+ * protocol decoded by telemetryReceiverTask (SOH + stuffed payload +
+ * stuffed CRC-16/CCITT-FALSE + CAN).
+ *
+ * @return ESP_OK on success, error code otherwise.
+ */
+esp_err_t sensor_emulator_task_init(void);
+```
+
+**Internal configuration:**
+
+```c
+#define EMUL_UART_NUM        UART_NUM_1   /* shared with telemetryReceiverTask */
+#define EMUL_JSON_BUF_SIZE   384          /* max JSON payload length            */
+#define EMUL_WIRE_BUF_SIZE   (2 * EMUL_JSON_BUF_SIZE + 6)  /* worst-case frame */
+#define EMUL_TASK_STACK_SIZE 4096
+#define EMUL_TASK_PRIORITY   4
+#define EMUL_PERIOD_MS       1000u
+
+/* Framing constants — identical to those in telemetryReceiverTask */
+#define FRAME_SOH  0x01u
+#define FRAME_CAN  0x18u
+#define FRAME_DLE  0x10u
+```
+
+> UART1 driver installation, baud rate, and pin assignment (TX=GPIO4) are performed exclusively by `app_main()`. `sensor_emulator_task_init()` only creates the FreeRTOS task.
+
+**Wire frame produced per packet:**
+
+```
+┌───────┬──────────────────────────────┬─────────────┬─────────────┬───────┐
+│ SOH   │ Stuffed JSON Payload         │ Stuffed     │ Stuffed     │ CAN   │
+│ 0x01  │ (ASCII, variable length)     │ CRC-H       │ CRC-L       │ 0x18  │
+└───────┴──────────────────────────────┴─────────────┴─────────────┴───────┘
+```
+
+The byte-stuffing and CRC-16/CCITT-FALSE rules are **identical** to the protocol decoded by `telemetryReceiverTask` (see §3). The JSON payload is pure printable ASCII so control bytes (`0x01`, `0x10`, `0x18`) cannot appear in the payload in practice, but the stuffing loop handles them correctly regardless. The two CRC bytes are stuffed independently.
+
+**JSON output schema** (mirrors the MQTT payload defined in `sensorData.md`):
+
+```json
+{"seq":N,"tim":"HH:MM:SS.mmm",
+ "vhl":{"accX":...},"accY":...},"accZ":...},"thr":...},
+ "mtr":{"pwr":...},"rpm":...},"trq":...},
+ "spc":{"vsc":...},"tankP":...},"fan":...},"h2P1":...},"h2P2":...}}
+```
+
+**Waveform assignments:**
+
+| JSON key | Range | Waveform | Period |
+|----------|-------|----------|--------|
+| `accX` | −4096 … +4095 counts | sine | 5 s |
+| `accY` | −4096 … +4095 counts | cosine | 7 s |
+| `accZ` | −4096 … +4095 counts | triangle | 3 s |
+| `thr` | 0 … 100 % | trapezoid | 10 s |
+| `pwr` | −1000 … +1000 W | sine | 8 s |
+| `rpm` | −10000 … +10000 RPM | cosine | 12 s |
+| `trq` | −100 … +100 Nm | square | 6 s |
+| `vsc` | 0.0 … 100.0 V | triangle | 15 s |
+| `tankP` | 0.00 … 500.00 Bar | trapezoid | 20 s |
+| `fan` | 0 … 100 % | \|sine\| (rectified) | 10 s |
+| `h2P1` | 0.00 … 1.00 Bar | sine | 4 s |
+| `h2P2` | 0.00 … 1.00 Bar | cosine | 6 s |
+
+**Waveform formulae** (continuous-time, all periods independent):
+
+| Waveform | Formula |
+|----------|---------|
+| Sine | `mid + amp·sin(2π·t/T)` |
+| Cosine | `mid + amp·cos(2π·t/T)` |
+| Triangle | `mid + amp·(4φ−1)` if φ<0.5 else `mid + amp·(3−4φ)` where φ=mod(t,T)/T |
+| Square | `hi` if φ<0.5 else `lo` |
+| Trapezoid | 25% rise → 25% hold-high → 25% fall → 25% hold-low |
+| \|Sine\| | `lo + \|sin(2π·t/T)\|·(hi−lo)` — non-negative only |
+
+The time base uses `esp_timer_get_time()` (µs since boot), ensuring phase continuity and wakeup accuracy independent of FreeRTOS tick jitter. `vTaskDelayUntil` is used for the 1 Hz cadence.
+
+### 5.4 CRC-16 Component — `components/crc16/`
 
 The CRC-16 implementation is sourced directly from `src/lib/CRC16.h` and `src/lib/CRC16.cpp` of the parent project. The component's `CMakeLists.txt` registers it as an ESP-IDF component so it can be linked by `main`.
 
@@ -393,13 +514,24 @@ uint16_t calculateCRC16(const uint8_t* data, size_t length);
 
 All log output uses the standard `ESP_LOG` macros. The default log level is `INFO`.
 
+### 6.1 `telemetryReceiverTask` (tag `TelemetryRx`)
+
 | Event | Log level | Format |
 |-------|-----------|--------|
 | Task started | `INFO` | `"Telemetry Receiver Task started, listening on UART1 RX=GPIO5"` |
 | Frame received, CRC OK | `INFO` | `"Frame OK [%u]: %s"` (frame count, payload string) |
-| CRC mismatch | `ERROR` | `"CRC FAIL [%u]: received=0x%04X computed=0x%04X payload='%.*s'"` |
+| CRC mismatch | `ERROR` | `"CRC FAIL [%u]: received=0x%04X computed=0x%04X payload='%s'"` |
 | Buffer overflow | `WARN` | `"Frame buffer overflow after %d bytes — discarding frame"` |
+| Unexpected SOH mid-frame | `WARN` | `"Unexpected SOH mid-frame after %d bytes — restarting"` |
 | Statistics | `INFO` | `"Stats: total=%u ok=%u crc_err=%u overflow=%u"` |
+
+### 6.2 `sensorEmulatorTask` (tag `SensorEmul`)
+
+| Event | Log level | Format |
+|-------|-----------|--------|
+| Task started | `INFO` | `"Sensor Emulator Task started — binary framed output on UART1 TX=GPIO4 @ 115200"` |
+| Packet transmitted | `INFO` | `"seq=%u payload=%d wire=%d crc=0x%04X"` |
+| JSON buffer overflow | `ERROR` | `"JSON buffer overflow at seq=%u (len=%d)"` |
 
 ---
 
@@ -418,16 +550,18 @@ All log output uses the standard `ESP_LOG` macros. The default log level is `INF
 
 ```
 tests/TelemetryEmulator/
-├── CMakeLists.txt         ← Top-level: cmake_minimum_required + project()
-├── sdkconfig.defaults     ← Minimal config (log level, UART, no WiFi/BT)
+├── CMakeLists.txt              ← Top-level: cmake_minimum_required + project()
+├── sdkconfig.defaults          ← Minimal config (log level, UART, no WiFi/BT)
 ├── main/
-│   ├── CMakeLists.txt     ← idf_component_register(SRCS main.cpp ...)
+│   ├── CMakeLists.txt          ← idf_component_register(SRCS main.cpp ...)
 │   ├── main.cpp
 │   ├── telemetryReceiverTask.h
-│   └── telemetryReceiverTask.cpp
+│   ├── telemetryReceiverTask.cpp
+│   ├── sensorEmulatorTask.h
+│   └── sensorEmulatorTask.cpp
 └── components/
     └── crc16/
-        ├── CMakeLists.txt ← idf_component_register(SRCS CRC16.cpp ...)
+        ├── CMakeLists.txt      ← idf_component_register(SRCS CRC16.cpp ...)
         ├── CRC16.h
         └── CRC16.cpp
 ```
@@ -467,11 +601,13 @@ idf.py -p COM<n> flash monitor
 
 | Condition | Behaviour |
 |-----------|----------|
-| UART driver install fails | `ESP_LOGE` + `abort()` in `app_main()` |
+| UART1 driver install fails | `ESP_LOGE` + `abort()` in `app_main()` |
+| `xTaskCreate` fails (either task) | `ESP_LOGE`, init function returns `ESP_FAIL`; `app_main()` calls `abort()` |
 | Unexpected `SOH` mid-frame | Reset state machine, restart from new `SOH`, `ESP_LOGW` |
 | Frame buffer overflow | Discard frame, `ESP_LOGW`, increment `frames_overflow`, return to `WAIT_SOH` |
 | CRC mismatch | Log full details with `ESP_LOGE`, increment `frames_crc_error`, continue |
 | Payload not null-terminated | Emitter always produces ASCII payloads ≤ 140 bytes; receiver null-terminates after `CAN` |
+| JSON serialisation overflow | `ESP_LOGE`, packet skipped; sequence counter still incremented |
 
 ---
 
@@ -486,14 +622,83 @@ idf.py -p COM<n> flash monitor
 | `ESP_LOGE` for CRC failures | Errors appear in red in the IDF monitor and serial log, making failures immediately visible during testing. |
 | Separate ESP-IDF component for CRC-16 | Keeps the CRC implementation in one place; the same source file can be shared with `src/lib/` in the parent project. |
 | No WiFi / BT in `sdkconfig.defaults` | Minimises build time and flash footprint; this firmware does nothing over the network. |
+| Deterministic waveforms for sensor emulation | Periodic signals with known analytical formulae make it trivial to verify receiver-side correctness: expected values at any timestamp can be computed offline. |
+| Different periods per signal | Incommensurable periods (e.g. 5 s, 7 s, 3 s …) ensure all combinations of field values occur within a short observation window, maximising test coverage. |
+| `esp_timer_get_time()` as time base | Provides µs resolution, monotonically increasing from boot, independent of FreeRTOS tick rate — ensures waveform phase is continuous and accurate. |
+| `vTaskDelayUntil` for 1 Hz cadence | Compensates for execution time inside the task body so the inter-packet interval stays exactly 1 s regardless of JSON serialisation overhead. |
+| `sensorEmulatorTask` uses same binary framing as `telemetryReceiverTask` | The TX output can be looped back to an RX input (or fed into any conformant NTRIP Client receiver) for end-to-end testing without a real GPS board. It also makes the two task halves symmetric and validates that the framing/CRC implementation is self-consistent. |
+| JSON payload inside binary frame | The frame envelope is identical to the position-telemetry protocol; only the payload content differs (JSON sensor data rather than CSV position). Keeps the wire protocol uniform while allowing the payload to carry any ASCII data. |
 
 ---
 
-## 10. Open Issues / Future Work
+## 10. Loopback Self-Test
+
+Because `sensorEmulatorTask` produces frames that are protocol-identical to those consumed by `telemetryReceiverTask`, the two tasks can be run in a **loopback configuration** on a single board with no external hardware other than a short wire.
+
+### 10.1 Hardware Setup
+
+Connect a single wire between:
+
+| From | To |
+|------|----|
+| GPIO4 (UART1 TX — emulator output) | GPIO5 (UART1 RX — receiver input) |
+
+No NTRIP Client board is required. Both tasks run on the same LOLIN S3 #2.
+
+```
+┌───────────────────────────────────────────────────────────┐
+│  TelemetryEmulator — LOLIN S3 #2  (loopback mode)         │
+│                                                           │
+│   sensorEmulatorTask                                      │
+│   UART1 TX → GPIO4 ──┐                                    │
+│                       │  short wire on-board              │
+│   UART1 RX ← GPIO5 ◄─┘                                    │
+│   telemetryReceiverTask                                   │
+│   → decode frame                                          │
+│   → validate CRC-16                                       │
+│   → ESP_LOGI / ESP_LOGE                                   │
+│                                                           │
+│   UART0 → USB debug monitor                               │
+└───────────────────────────────────────────────────────────┘
+```
+
+### 10.2 Expected Behaviour
+
+| Observation | Expected |
+|-------------|----------|
+| `TelemetryRx` log after each emitter packet | `Frame OK [N]: {"seq":N,...}` |
+| `TelemetryRx` CRC errors | **None** |
+| `TelemetryRx` buffer overflows | None (JSON payload ≤ ~250 bytes < 256-byte frame buffer) |
+| `SensorEmul` log per packet | `seq=N payload=P wire=W crc=0x????` |
+| Packet rate | 1 frame/second from emulator; receiver logs 1 OK line/second |
+
+Any `CRC FAIL` line in the monitor output indicates a bug in either the byte-stuffing encoder or the de-stuffing decoder and should be investigated immediately.
+
+### 10.3 Procedure
+
+1. Fit a short wire between GPIO4 and GPIO5 on the LOLIN S3.
+2. Flash the TelemetryEmulator firmware normally (`idf.py -p COM<n> flash`).
+3. Open the serial monitor (`idf.py -p COM<n> monitor`).
+4. Verify the startup messages from both tasks appear.
+5. Observe that `Frame OK` lines appear at ~1 Hz with no `CRC FAIL` messages.
+6. After at least 100 frames, verify the statistics line shows `crc_err=0` and `overflow=0`.
+7. Remove the wire; the receiver will go silent while the emulator continues transmitting (its packets are not echoed back).
+
+### 10.4 Limitations
+
+- The loopback validates framing and CRC correctness but **not** payload content correctness — the receiver logs the raw JSON string but does not parse the field values.
+- The emitter runs at 1 Hz; the NTRIP Client transmits at 10 Hz. A 10 Hz stress test requires either a second board or a software change to `EMUL_PERIOD_MS`.
+
+---
+
+## 11. Open Issues / Future Work
 
 | # | Item | Priority |
 |---|------|----------|
 | 1 | Parse the decoded payload CSV and display individual fields (lat, lon, alt, fix quality) in the log | Low |
-| 2 | Add a statistics UART output so results can be read by a second device or test harness | Low |
+| 2 | ~~Add a statistics UART output~~ — superseded by `sensorEmulatorTask` binary-framed JSON output on UART1 TX | Closed |
 | 3 | Add Catch2-based host-side unit test for the frame decoder logic (stripped of ESP-IDF dependencies) | Medium |
 | 4 | Add PlatformIO `platformio.ini` as an alternative build method alongside `idf.py` | Low |
+| 5 | Add a Catch2-based host-side unit test for the waveform generators in `sensorEmulatorTask` | Low |
+| 6 | Add a `CONFIG_EMUL_PERIOD_MS` sdkconfig option to allow the JSON publish rate to be overridden at build time without editing source | Low |
+| 7 | Optionally encode the JSON as MessagePack or CBOR to reduce wire bandwidth when connected to an automated test harness | Low |
