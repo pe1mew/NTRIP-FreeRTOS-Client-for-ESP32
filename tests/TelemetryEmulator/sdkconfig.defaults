@@ -5,3 +5,5 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 # Disable unused subsystems to minimise flash size
 CONFIG_BT_ENABLED=n
 CONFIG_WIFI_ENABLED=n
+# Sensor emulator publish period (ms) — override to 100 for 10 Hz stress test
+CONFIG_EMUL_PERIOD_MS=1000

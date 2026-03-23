@@ -34,9 +34,16 @@
 #define EMUL_WIRE_BUF_SIZE  (2 * EMUL_JSON_BUF_SIZE + 6)
 
 /* ── Task parameters ─────────────────────────────────────────────────────── */
-#define EMUL_TASK_STACK_SIZE 4096
-#define EMUL_TASK_PRIORITY   4
-#define EMUL_PERIOD_MS       1000u
+#define EMUL_TASK_STACK_SIZE   4096
+#define EMUL_TASK_PRIORITY     4
+/* Publish period is set via CONFIG_EMUL_PERIOD_MS in main/Kconfig.projbuild.
+ * Default 1000 ms (1 Hz).  Override in sdkconfig or via idf.py menuconfig. */
+#define EMUL_PERIOD_MS         ((uint32_t)CONFIG_EMUL_PERIOD_MS)
+
+/* ── CRC-inject button ───────────────────────────────────────────────────── */
+/* LOLIN S3 BOOT button — active LOW, internal pull-up enabled.              */
+/* Hold while running to corrupt each outgoing frame and trigger CRC FAIL.   */
+#define EMUL_CRC_INJECT_PIN    GPIO_NUM_0
 
 static const char *TAG = "SensorEmul";
 
@@ -213,6 +220,12 @@ static void sensor_emulator_task(void *arg)
         /* ── Compute CRC-16/CCITT-FALSE on raw payload ───────────────────── */
         uint16_t crc = calculateCRC16((const uint8_t *)json_buf, (size_t)len);
 
+        /* ── CRC inject: corrupt payload if BOOT button is held ─────────── */
+        if (gpio_get_level(EMUL_CRC_INJECT_PIN) == 0) {
+            json_buf[0] ^= 0x01;   /* flip LSB of first byte — CRC will mismatch */
+            ESP_LOGW(TAG, "CRC inject active — corrupting frame seq=%u", (unsigned)seq);
+        }
+
         /* ── Build wire frame: SOH + stuffed payload + stuffed CRC + CAN ─── */
         int wlen = 0;
 
@@ -248,6 +261,7 @@ static void sensor_emulator_task(void *arg)
         wire[wlen++] = FRAME_CAN;
 
         uart_write_bytes(EMUL_UART_NUM, wire, (size_t)wlen);
+        uart_wait_tx_done(EMUL_UART_NUM, portMAX_DELAY);
         led_blink_blue();
         ESP_LOGI(TAG, "seq=%u payload=%d wire=%d crc=0x%04X",
                  (unsigned)seq, len, wlen, (unsigned)crc);
@@ -260,7 +274,16 @@ static void sensor_emulator_task(void *arg)
 esp_err_t sensor_emulator_task_init(void)
 {
     /* UART1 driver, baud rate, and pin assignment are handled by app_main().
-     * Nothing to configure here — just create the task. */
+     * Nothing to configure here except the CRC-inject button GPIO. */
+
+    /* ── Configure BOOT button (GPIO0) as input with pull-up ─────────────── */
+    gpio_config_t btn = {};
+    btn.intr_type    = GPIO_INTR_DISABLE;
+    btn.mode         = GPIO_MODE_INPUT;
+    btn.pin_bit_mask = (1ULL << EMUL_CRC_INJECT_PIN);
+    btn.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    btn.pull_up_en   = GPIO_PULLUP_ENABLE;
+    gpio_config(&btn);
 
     /* ── Create task ──────────────────────────────────────────────────────── */
     BaseType_t ret = xTaskCreate(

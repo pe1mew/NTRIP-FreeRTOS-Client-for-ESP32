@@ -59,7 +59,7 @@ static void telemetry_receiver_task(void *arg)
     uint32_t frames_overflow = 0;
 
     while (true) {
-        int bytes = uart_read_bytes(RECV_UART_NUM, rx_buf, sizeof(rx_buf), portMAX_DELAY);
+        int bytes = uart_read_bytes(RECV_UART_NUM, rx_buf, 1, portMAX_DELAY);
         if (bytes <= 0) {
             continue;
         }
@@ -117,15 +117,13 @@ static void telemetry_receiver_task(void *arg)
                     if (computed_crc == received_crc) {
                         ++frames_ok;
                         led_blink_green();
-                        ESP_LOGI(TAG, "Frame OK [%u]: %s",
-                                 (unsigned)frames_total,
+                        ESP_LOGI(TAG, "Frame OK: %s",
                                  reinterpret_cast<const char *>(frame_buf));
                     } else {
                         ++frames_crc_err;
                         led_blink_red();
                         ESP_LOGE(TAG,
-                                 "CRC FAIL [%u]: received=0x%04X computed=0x%04X payload='%s'",
-                                 (unsigned)frames_total,
+                                 "CRC FAIL: received=0x%04X computed=0x%04X payload='%s'",
                                  (unsigned)received_crc,
                                  (unsigned)computed_crc,
                                  reinterpret_cast<const char *>(frame_buf));

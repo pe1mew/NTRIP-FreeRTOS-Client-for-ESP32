@@ -1,8 +1,8 @@
 # TelemetryEmulator — Design Document
 
 **Module:** `tests/TelemetryEmulator`
-**Version:** 4.0
-**Date:** 2026-03-22
+**Version:** 4.1
+**Date:** 2026-03-23
 **Author:** NTRIP FreeRTOS Client Project
 
 ---
@@ -87,12 +87,16 @@ tests/
 ├── CRC16/            ← Host-side CRC-16 unit tests (Code::Blocks / MinGW)
 ├── NMEAparser/       ← Host-side NMEA unit tests (Code::Blocks / MinGW)
 └── TelemetryEmulator/
-    ├── design.md             ← This document
+    ├── documentation/
+    │   ├── design.md         ← This document
+    │   └── sensorData.md     ← MQTT sensor data specification
     ├── CMakeLists.txt        ← ESP-IDF build
     ├── sdkconfig.defaults    ← Minimal ESP-IDF config
     ├── main/
     │   ├── CMakeLists.txt
     │   ├── main.cpp                  ← app_main()
+    │   ├── ledTask.h
+    │   ├── ledTask.cpp               ← WS2812B RGB LED indicator task
     │   ├── telemetryReceiverTask.h
     │   ├── telemetryReceiverTask.cpp
     │   ├── sensorEmulatorTask.h
@@ -206,12 +210,15 @@ YYYY-MM-DD HH:mm:ss.sss,LAT,LON,ALT,HEADING,SPEED,FIXQ
 
 | Component | File(s) | Responsibility |
 |-----------|---------|----------------|
-| **Application entry** | `main/main.cpp` | `app_main()`: UART1 init (RX=GPIO5, TX=GPIO4, with TX ring buffer), task creation |
+| **Application entry** | `main/main.cpp` | `app_main()`: UART1 init (RX=GPIO5, TX=GPIO4, with TX ring buffer), then starts LED, receiver, and emulator tasks |
+| **LED indicator task** | `main/ledTask.h/.cpp` | FreeRTOS task driven by a queue; blinks the onboard WS2812B RGB LED: green (CRC OK), red (CRC FAIL), blue (packet sent) |
 | **Receiver task** | `main/telemetryReceiverTask.h/.cpp` | FreeRTOS task, frame state machine, CRC validation, `ESP_LOG` reporting — uses UART1 RX |
-| **Sensor emulator task** | `main/sensorEmulatorTask.h/.cpp` | FreeRTOS task, deterministic waveform generation, JSON serialisation, UART1 TX output at 1 Hz |
+| **Sensor emulator task** | `main/sensorEmulatorTask.h/.cpp` | FreeRTOS task, deterministic waveform generation, JSON serialisation, UART1 TX output at 1 Hz; BOOT button (GPIO0) triggers CRC injection |
 | **CRC-16** | `components/crc16/CRC16.h/.cpp` | Shared CRC-16-CCITT-FALSE calculation (sourced from `src/lib/CRC16`) |
 
 ### 4.2 Component Diagram (PlantUML)
+
+![Component Diagram](Component_Diagram.png)
 
 ```plantuml
 @startuml TelemetryEmulator_Components
@@ -226,7 +233,16 @@ skinparam component {
 
 package "TelemetryEmulator Firmware — LOLIN S3 #2" {
 
-    component [app_main()\ninitialise UART1 & UART2\ncreate tasks] as Main <<task>>
+    component [app_main()\ninitialise UART1 (RX=GPIO5, TX=GPIO4)\ncreate tasks] as Main <<task>>
+
+    component [ledTask\n(FreeRTOS task)] as LedTask <<task>>
+    note right of LedTask
+      Queue-driven WS2812B
+      RGB LED (GPIO38):
+        green  = CRC OK
+        red    = CRC FAIL
+        blue   = packet sent
+    end note
 
     component [telemetryReceiverTask\n(FreeRTOS task)] as RecvTask <<task>>
     note right of RecvTask
@@ -237,41 +253,50 @@ package "TelemetryEmulator Firmware — LOLIN S3 #2" {
       On frame complete:
         de-stuff payload
         validate CRC-16
+        led_blink_green/red()
         ESP_LOGI / ESP_LOGE
     end note
 
     component [sensorEmulatorTask\n(FreeRTOS task)] as EmulTask <<task>>
     note left of EmulTask
-      1 Hz timer
+      1 Hz timer (vTaskDelayUntil)
       waveform generators:
         sine, cosine, triangle
         square, trapezoid, |sine|
       JSON serialise
       CRC-16 compute
+      BOOT button CRC-inject
       byte-stuff + frame
       uart_write_bytes(UART1 TX)
+      uart_wait_tx_done()
+      led_blink_blue()
     end note
 
     component [CRC-16\n(calculateCRC16)] as CRC16 <<util>>
 
-    component [ESP-IDF UART1 Driver\n(115200 8N1, RX=GPIO5)] as UART1 <<io>>
+    component [ESP-IDF UART1 Driver\n(115200 8N1\nRX=GPIO5, TX=GPIO4)] as UART1 <<io>>
 
-    component [ESP-IDF UART2 Driver\n(115200 8N1, TX=GPIO17)] as UART2 <<io>>
+    component [GPIO0\n(BOOT button\nINPUT_PULLUP)] as BOOTBTN <<io>>
 
+    Main --> LedTask   : xTaskCreate()
     Main --> RecvTask  : xTaskCreate()
     Main --> EmulTask  : xTaskCreate()
-    RecvTask --> UART1  : uart_read_bytes()
+    RecvTask --> UART1  : uart_read_bytes(1 byte)
     RecvTask --> CRC16  : calculateCRC16(payload, len)
+    RecvTask --> LedTask : led_blink_green() / led_blink_red()
     RecvTask --> RecvTask : ESP_LOGI / ESP_LOGE
-    EmulTask --> UART2  : uart_write_bytes(json, len)
-    EmulTask --> EmulTask : ESP_LOGI
+    EmulTask --> BOOTBTN : gpio_get_level()
+    EmulTask --> UART1  : uart_write_bytes() + uart_wait_tx_done()
+    EmulTask --> LedTask : led_blink_blue()
+    EmulTask --> EmulTask : ESP_LOGI / ESP_LOGW
+    EmulTask --> CRC16  : calculateCRC16(payload, len)
 }
 
 component [NTRIP Client LOLIN S3\n(dataOutputTask)] as NTRIPBoard <<external>>
-component [Serial terminal /\ntest harness] as Consumer <<external>>
+component [USB Debug Monitor] as Consumer <<external>>
 
 NTRIPBoard --> UART1 : GPIO15 TX → GPIO5 RX\n115200 baud 8N1
-UART2 --> Consumer : GPIO17 TX\n115200 baud 8N1, JSON lines
+Main --> Consumer : UART0 (USB)\nESP_LOG output
 
 @enduml
 ```
@@ -279,6 +304,8 @@ UART2 --> Consumer : GPIO17 TX\n115200 baud 8N1, JSON lines
 ### 4.3 Frame Decoder State Machine
 
 The receiver task processes incoming bytes one at a time using a three-state machine:
+
+![Frame Decoder State Machine](FrameDecoderStateMachine.png)
 
 ```plantuml
 @startuml TelemetryEmulator_StateMachine
@@ -305,6 +332,8 @@ AFTER_DLE --> IN_FRAME  : any byte\n(append literal to buffer)
 
 ### 4.4 Sequence Diagram
 
+![Sequence Diagram](SequenceDiagram.png)
+
 ```plantuml
 @startuml TelemetryEmulator_Sequence
 
@@ -316,8 +345,8 @@ participant "CRC-16\ncalculateCRC16()" as CRC
 Sender -> UART : SOH + stuffed_payload\n+ stuffed_CRC_H\n+ stuffed_CRC_L + CAN
 
 loop forever
-    Task -> UART : uart_read_bytes(buf, size, portMAX_DELAY)
-    UART --> Task : raw bytes
+    Task -> UART : uart_read_bytes(buf, 1, portMAX_DELAY)
+    UART --> Task : 1 byte
 
     loop for each byte
         alt byte == SOH
@@ -353,9 +382,10 @@ end
 
 Responsibilities:
 1. Configure and install UART1 (`UART_NUM_1`, 115200 baud, 8N1, RX=GPIO5, TX=GPIO4) with a 1024-byte RX ring buffer and a 512-byte TX ring buffer
-2. Call `telemetry_receiver_task_init()` to create the telemetry receiver FreeRTOS task
-3. Call `sensor_emulator_task_init()` to create the sensor emulator FreeRTOS task (no UART setup — reuses UART1)
-4. Return (the task scheduler takes over)
+2. Call `led_task_init()` to create the LED indicator FreeRTOS task (configures RMT for the onboard WS2812B on GPIO38)
+3. Call `telemetry_receiver_task_init()` to create the telemetry receiver FreeRTOS task
+4. Call `sensor_emulator_task_init()` to create the sensor emulator FreeRTOS task (configures GPIO0 as input with pull-up, then creates the task; reuses UART1)
+5. Return (the task scheduler takes over)
 
 ### 5.2 `telemetryReceiverTask` — `main/telemetryReceiverTask.h/.cpp`
 
@@ -431,9 +461,12 @@ esp_err_t sensor_emulator_task_init(void);
 #define EMUL_UART_NUM        UART_NUM_1   /* shared with telemetryReceiverTask */
 #define EMUL_JSON_BUF_SIZE   384          /* max JSON payload length            */
 #define EMUL_WIRE_BUF_SIZE   (2 * EMUL_JSON_BUF_SIZE + 6)  /* worst-case frame */
-#define EMUL_TASK_STACK_SIZE 4096
-#define EMUL_TASK_PRIORITY   4
-#define EMUL_PERIOD_MS       1000u
+#define EMUL_TASK_STACK_SIZE   4096
+#define EMUL_TASK_PRIORITY     4
+#define EMUL_PERIOD_MS         1000u
+
+/* CRC-inject button — LOLIN S3 BOOT button, active LOW, internal pull-up */
+#define EMUL_CRC_INJECT_PIN    GPIO_NUM_0
 
 /* Framing constants — identical to those in telemetryReceiverTask */
 #define FRAME_SOH  0x01u
@@ -441,7 +474,11 @@ esp_err_t sensor_emulator_task_init(void);
 #define FRAME_DLE  0x10u
 ```
 
-> UART1 driver installation, baud rate, and pin assignment (TX=GPIO4) are performed exclusively by `app_main()`. `sensor_emulator_task_init()` only creates the FreeRTOS task.
+> UART1 driver installation, baud rate, and pin assignment (TX=GPIO4) are performed exclusively by `app_main()`. `sensor_emulator_task_init()` configures GPIO0 as an input with pull-up and then creates the FreeRTOS task.
+
+**CRC injection (BOOT button):** After the CRC is computed over the clean payload but before the wire frame is built, the task reads GPIO0. If the BOOT button is held (pin LOW), bit 0 of the first payload byte is flipped. The CRC in the frame remains correct for the *original* payload bytes, so the receiver's recomputed CRC will not match → `CRC FAIL`. Releasing the button restores clean frames immediately. A `WARN`-level log is emitted for every corrupted frame.
+
+**Sender log timing:** `uart_wait_tx_done()` is called after `uart_write_bytes()` so the `SensorEmul` log line appears only after the last bit of the frame has cleared the UART shift register. This ensures the log timestamp reflects the actual end-of-transmission rather than the moment bytes were queued in the TX ring buffer.
 
 **Wire frame produced per packet:**
 
@@ -519,8 +556,8 @@ All log output uses the standard `ESP_LOG` macros. The default log level is `INF
 | Event | Log level | Format |
 |-------|-----------|--------|
 | Task started | `INFO` | `"Telemetry Receiver Task started, listening on UART1 RX=GPIO5"` |
-| Frame received, CRC OK | `INFO` | `"Frame OK [%u]: %s"` (frame count, payload string) |
-| CRC mismatch | `ERROR` | `"CRC FAIL [%u]: received=0x%04X computed=0x%04X payload='%s'"` |
+| Frame received, CRC OK | `INFO` | `"Frame OK: %s"` (payload string) |
+| CRC mismatch | `ERROR` | `"CRC FAIL: received=0x%04X computed=0x%04X payload='%s'"` |
 | Buffer overflow | `WARN` | `"Frame buffer overflow after %d bytes — discarding frame"` |
 | Unexpected SOH mid-frame | `WARN` | `"Unexpected SOH mid-frame after %d bytes — restarting"` |
 | Statistics | `INFO` | `"Stats: total=%u ok=%u crc_err=%u overflow=%u"` |
@@ -531,6 +568,7 @@ All log output uses the standard `ESP_LOG` macros. The default log level is `INF
 |-------|-----------|--------|
 | Task started | `INFO` | `"Sensor Emulator Task started — binary framed output on UART1 TX=GPIO4 @ 115200"` |
 | Packet transmitted | `INFO` | `"seq=%u payload=%d wire=%d crc=0x%04X"` |
+| CRC inject active | `WARN` | `"CRC inject active — corrupting frame seq=%u"` |
 | JSON buffer overflow | `ERROR` | `"JSON buffer overflow at seq=%u (len=%d)"` |
 
 ---
@@ -550,11 +588,16 @@ All log output uses the standard `ESP_LOG` macros. The default log level is `INF
 
 ```
 tests/TelemetryEmulator/
+├── documentation/
+│   ├── design.md               ← This document
+│   └── sensorData.md           ← MQTT sensor data specification
 ├── CMakeLists.txt              ← Top-level: cmake_minimum_required + project()
 ├── sdkconfig.defaults          ← Minimal config (log level, UART, no WiFi/BT)
 ├── main/
 │   ├── CMakeLists.txt          ← idf_component_register(SRCS main.cpp ...)
 │   ├── main.cpp
+│   ├── ledTask.h
+│   ├── ledTask.cpp             ← WS2812B RGB LED indicator task
 │   ├── telemetryReceiverTask.h
 │   ├── telemetryReceiverTask.cpp
 │   ├── sensorEmulatorTask.h
@@ -602,7 +645,7 @@ idf.py -p COM<n> flash monitor
 | Condition | Behaviour |
 |-----------|----------|
 | UART1 driver install fails | `ESP_LOGE` + `abort()` in `app_main()` |
-| `xTaskCreate` fails (either task) | `ESP_LOGE`, init function returns `ESP_FAIL`; `app_main()` calls `abort()` |
+| `xTaskCreate` fails (any task) | `ESP_LOGE`, init function returns `ESP_FAIL`; `app_main()` calls `abort()` |
 | Unexpected `SOH` mid-frame | Reset state machine, restart from new `SOH`, `ESP_LOGW` |
 | Frame buffer overflow | Discard frame, `ESP_LOGW`, increment `frames_overflow`, return to `WAIT_SOH` |
 | CRC mismatch | Log full details with `ESP_LOGE`, increment `frames_crc_error`, continue |
@@ -628,6 +671,9 @@ idf.py -p COM<n> flash monitor
 | `vTaskDelayUntil` for 1 Hz cadence | Compensates for execution time inside the task body so the inter-packet interval stays exactly 1 s regardless of JSON serialisation overhead. |
 | `sensorEmulatorTask` uses same binary framing as `telemetryReceiverTask` | The TX output can be looped back to an RX input (or fed into any conformant NTRIP Client receiver) for end-to-end testing without a real GPS board. It also makes the two task halves symmetric and validates that the framing/CRC implementation is self-consistent. |
 | JSON payload inside binary frame | The frame envelope is identical to the position-telemetry protocol; only the payload content differs (JSON sensor data rather than CSV position). Keeps the wire protocol uniform while allowing the payload to carry any ASCII data. |
+| `uart_read_bytes` with `size=1` | Reading one byte per call with `portMAX_DELAY` blocks only until the next UART byte arrives, so the state machine processes each byte immediately and `Frame OK` is logged the instant `CAN` is received — no batching delay. |
+| `uart_wait_tx_done()` after `uart_write_bytes()` | Ensures the `SensorEmul` log timestamp reflects the actual end-of-transmission rather than the moment bytes were queued. In loopback, this means `Frame OK` appears before the sender log, confirming the receiver processed the frame while the UART was still draining. |
+| BOOT button (GPIO0) as CRC-inject trigger | Provides a hardware-controlled, hands-on way to exercise the CRC error path without modifying firmware. Holding the button corrupts every outgoing frame; releasing it restores clean frames immediately, exercising both the error and recovery paths at will. |
 
 ---
 
@@ -651,7 +697,7 @@ No NTRIP Client board is required. Both tasks run on the same LOLIN S3 #2.
 │                                                           │
 │   sensorEmulatorTask                                      │
 │   UART1 TX → GPIO4 ──┐                                    │
-│                       │  short wire on-board              │
+│                      │  short wire on-board               │
 │   UART1 RX ← GPIO5 ◄─┘                                    │
 │   telemetryReceiverTask                                   │
 │   → decode frame                                          │
@@ -666,13 +712,14 @@ No NTRIP Client board is required. Both tasks run on the same LOLIN S3 #2.
 
 | Observation | Expected |
 |-------------|----------|
-| `TelemetryRx` log after each emitter packet | `Frame OK [N]: {"seq":N,...}` |
+| `TelemetryRx` log after each emitter packet | `Frame OK: {"seq":N,...}` |
 | `TelemetryRx` CRC errors | **None** |
 | `TelemetryRx` buffer overflows | None (JSON payload ≤ ~250 bytes < 256-byte frame buffer) |
-| `SensorEmul` log per packet | `seq=N payload=P wire=W crc=0x????` |
-| Packet rate | 1 frame/second from emulator; receiver logs 1 OK line/second |
+| `SensorEmul` log per packet | `seq=N payload=P wire=W crc=0x????` (appears after `Frame OK`) |
+| Packet rate | 1 frame/second from emulator; both tasks log 1 line/second |
+| Log order per packet | `TelemetryRx: Frame OK` first, then `SensorEmul: seq=N` a few milliseconds later |
 
-Any `CRC FAIL` line in the monitor output indicates a bug in either the byte-stuffing encoder or the de-stuffing decoder and should be investigated immediately.
+Any `CRC FAIL` line in the monitor output (without holding the BOOT button) indicates a bug in either the byte-stuffing encoder or the de-stuffing decoder and should be investigated immediately.
 
 ### 10.3 Procedure
 
@@ -684,7 +731,17 @@ Any `CRC FAIL` line in the monitor output indicates a bug in either the byte-stu
 6. After at least 100 frames, verify the statistics line shows `crc_err=0` and `overflow=0`.
 7. Remove the wire; the receiver will go silent while the emulator continues transmitting (its packets are not echoed back).
 
-### 10.4 Limitations
+### 10.4 CRC Injection Test
+
+The BOOT button on the LOLIN S3 (GPIO0, active LOW) can be used at any time during the loopback test to verify that the receiver correctly detects CRC errors:
+
+1. With the loopback wire fitted and the monitor open, confirm `Frame OK` lines are appearing at 1 Hz.
+2. Hold the BOOT button down.
+3. The monitor should immediately show alternating `SensorEmul: CRC inject active` and `TelemetryRx: CRC FAIL` lines instead of `Frame OK`.
+4. Release the button — `Frame OK` lines resume on the next packet.
+5. Verify the statistics line (every 100 frames) reflects the correct `crc_err` count.
+
+### 10.5 Limitations
 
 - The loopback validates framing and CRC correctness but **not** payload content correctness — the receiver logs the raw JSON string but does not parse the field values.
 - The emitter runs at 1 Hz; the NTRIP Client transmits at 10 Hz. A 10 Hz stress test requires either a second board or a software change to `EMUL_PERIOD_MS`.
@@ -695,10 +752,5 @@ Any `CRC FAIL` line in the monitor output indicates a bug in either the byte-stu
 
 | # | Item | Priority |
 |---|------|----------|
-| 1 | Parse the decoded payload CSV and display individual fields (lat, lon, alt, fix quality) in the log | Low |
-| 2 | ~~Add a statistics UART output~~ — superseded by `sensorEmulatorTask` binary-framed JSON output on UART1 TX | Closed |
-| 3 | Add Catch2-based host-side unit test for the frame decoder logic (stripped of ESP-IDF dependencies) | Medium |
-| 4 | Add PlatformIO `platformio.ini` as an alternative build method alongside `idf.py` | Low |
-| 5 | Add a Catch2-based host-side unit test for the waveform generators in `sensorEmulatorTask` | Low |
-| 6 | Add a `CONFIG_EMUL_PERIOD_MS` sdkconfig option to allow the JSON publish rate to be overridden at build time without editing source | Low |
-| 7 | Optionally encode the JSON as MessagePack or CBOR to reduce wire bandwidth when connected to an automated test harness | Low |
+| 1 | Add a Catch2-based host-side unit test for the waveform generators in `sensorEmulatorTask` | Low |
+| 2 | ~~`CONFIG_EMUL_PERIOD_MS` sdkconfig option for JSON publish rate~~ — implemented: `main/Kconfig.projbuild` exposes the option; `sdkconfig.defaults` sets the default to 1000 ms | Closed |

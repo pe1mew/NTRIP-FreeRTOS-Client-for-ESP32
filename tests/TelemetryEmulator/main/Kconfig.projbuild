@@ -1,0 +1,13 @@
+menu "TelemetryEmulator"
+
+    config EMUL_PERIOD_MS
+        int "Sensor emulator publish period (ms)"
+        default 1000
+        range 100 60000
+        help
+            JSON telemetry packet interval in milliseconds.
+            Default 1000 ms = 1 Hz.  Reduce to 100 ms for a 10 Hz stress test
+            matching the NTRIP Client transmit rate.  Increase beyond 1000 ms
+            for slower, human-readable output.
+
+endmenu
