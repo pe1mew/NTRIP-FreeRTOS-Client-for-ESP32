@@ -9,11 +9,11 @@
 
 ## 1. Purpose & Scope
 
-The TelemetryEmulator is a standalone ESP32-S3 (LOLIN S3) firmware application that runs two independent FreeRTOS tasks:
+The TelemetryEmulator is a standalone ESP32-S3 (LOLIN S3) firmware application that acts as a **bilateral test harness** for the NTRIP Client's telemetry and sensor-data pipelines. It runs two independent FreeRTOS tasks:
 
-1. **`telemetryReceiverTask`** — acts as a **receiver** for the binary telemetry stream produced by the NTRIP Client firmware running on a second LOLIN S3 board. The two boards are connected by a direct UART wire. The task decodes incoming frames, validates the CRC-16 checksum, and reports any CRC errors to the debug console via `ESP_LOGE`.
+1. **`telemetryReceiverTask`** — acts as a **receiver** for binary telemetry frames transmitted by the NTRIP Client firmware (running on a second LOLIN S3 board) over a direct UART wire. The task decodes incoming frames, validates the CRC-16 checksum, and reports any errors to the debug console via `ESP_LOGE`. This validates one direction of the bilateral link: that the NTRIP Client correctly frames its outgoing position telemetry and that the CRC-16 is intact end-to-end.
 
-2. **`sensorEmulatorTask`** — generates a deterministic JSON telemetry packet every 1 second, wraps it in the same SOH/DLE-stuffed/CRC-16/CAN binary frame format used by the NTRIP Client, and transmits it over UART1 TX (GPIO4). Each JSON field is driven by a periodic waveform (sine, cosine, triangle, square, trapezoid, or rectified sine) scaled to the min/max range specified by the MQTT interface in `sensorData.md`. Because the output is protocol-compatible with the receiver, GPIO4 TX can be wired to GPIO5 RX for a self-contained loopback test that exercises the full encode → decode → CRC-validate chain on a single board.
+2. **`sensorEmulatorTask`** — generates a deterministic JSON sensor-data packet every 1 second, wraps it in the SOH/DLE-stuffed/CRC-16/CAN binary frame format, and transmits it over UART1 TX (GPIO4) **to the NTRIP Client**. The NTRIP Client receives these frames, verifies their CRC-16, deserialises the JSON payload, and publishes the sensor fields to its configured MQTT broker. This validates the other direction: that the NTRIP Client correctly receives, parses, and forwards sensor data. Each JSON field is driven by a periodic waveform (sine, cosine, triangle, square, trapezoid, or rectified sine) scaled to the min/max range specified by the MQTT interface in `sensorData.md`. Because the output is protocol-compatible with `telemetryReceiverTask`, GPIO4 TX can also be wired to GPIO5 RX for a self-contained single-board loopback test that exercises the full encode → decode → CRC-validate chain without requiring the NTRIP Client board.
 
 ### Goals
 
@@ -21,16 +21,18 @@ The TelemetryEmulator is a standalone ESP32-S3 (LOLIN S3) firmware application t
 - Decode the binary framing protocol (byte de-stuffing, SOH/CAN boundary detection)
 - Validate each frame's CRC-16 checksum and report failures via `ESP_LOGE`
 - Log successfully decoded payloads via `ESP_LOGI` for visual confirmation
-- Generate deterministic JSON telemetry packets every 1 second with signal values driven by periodic waveforms (sine, cosine, triangle, square, trapezoid, |sine|)
-- Encode each packet as a binary frame (SOH + byte-stuffed payload + stuffed CRC-16 + CAN) identical to the format received by `telemetryReceiverTask`
-- Transmit binary-framed packets over UART1 TX (GPIO4, 115200 baud)
-- Support a single-board loopback test by connecting GPIO4 TX → GPIO5 RX
+- Generate deterministic JSON sensor-data packets every 1 second with signal values driven by periodic waveforms (sine, cosine, triangle, square, trapezoid, |sine|)
+- Encode each packet as a binary frame (SOH + byte-stuffed payload + stuffed CRC-16 + CAN) and transmit it to the NTRIP Client over UART1 TX (GPIO4, 115200 baud)
+- Verify that the NTRIP Client correctly receives, CRC-validates, and publishes the sensor data to its configured MQTT broker
+- Act as a bilateral test harness: validate CRC of frames received **from** the NTRIP Client while simultaneously injecting test sensor data **to** the NTRIP Client
+- Support a single-board loopback test by connecting GPIO4 TX → GPIO5 RX (exercises framing/CRC without the NTRIP Client board)
 - Run both functions as independent FreeRTOS tasks, consistent with the architecture of the main project
 
 ### Non-Goals
 
-- Does **not** act as an NTRIP client — it only processes telemetry frames
-- Does **not** run a WiFi stack, HTTP server, or MQTT client
+- Does **not** act as an NTRIP client — it only processes telemetry frames and injects sensor data
+- Does **not** run a WiFi stack, HTTP server, or MQTT client — the MQTT broker connection lives entirely within the NTRIP Client firmware
+- Does **not** parse or validate the *values* of JSON fields it receives — it only validates frame framing and CRC-16 integrity
 - Does **not** replace the host-side unit tests in `tests/NMEAparser/` or `tests/CRC16/`
 
 ---
@@ -70,14 +72,13 @@ Shared: GND ──────────────────────�
 
 ### 2.2 Hardware Wiring
 
-| Signal | NTRIP Client (LOLIN S3 #1) | TelemetryEmulator (LOLIN S3 #2) | Direction |
-|--------|---------------------------|----------------------------------|----------|
-| UART1 TX | GPIO15 (UART1 TX) | — | Client → Emulator |
-| UART1 RX | — | GPIO5 (UART1 RX) | Client → Emulator |
-| UART1 TX | — | GPIO4 (UART1 TX) | Emulator → consumer |
-| GND | GND | GND | shared |
+| Wire | From | To | Baud |
+|------|------|----|------|
+| Telemetry (Client → Emulator) | NTRIP Client GPIO15 (UART TX) | TelemetryEmulator GPIO5 (UART1 RX) | 115200 8N1 |
+| Sensor data (Emulator → Client) | TelemetryEmulator GPIO4 (UART1 TX) | NTRIP Client GPIO\<n\> (UART RX — see NTRIP Client project) | 115200 8N1 |
+| Ground | NTRIP Client GND | TelemetryEmulator GND | — |
 
-> **Note:** The TelemetryEmulator uses a single UART peripheral (UART1) for both tasks. `telemetryReceiverTask` reads on the RX wire (GPIO5 ← NTRIP Client GPIO15) and `sensorEmulatorTask` writes on the TX wire (GPIO4 → serial terminal / test harness). The two wires are electrically independent.
+> **Note:** The TelemetryEmulator uses a single UART peripheral (UART1) for both tasks. `telemetryReceiverTask` reads on the RX wire (GPIO5 ← NTRIP Client GPIO15) and `sensorEmulatorTask` writes on the TX wire (GPIO4 → NTRIP Client UART RX). The specific UART peripheral and GPIO pin used by the NTRIP Client for receiving sensor data is defined in the NTRIP Client project.
 
 ### 2.3 Relationship to Other Modules
 
@@ -101,12 +102,30 @@ tests/
     │   ├── telemetryReceiverTask.cpp
     │   ├── sensorEmulatorTask.h
     │   └── sensorEmulatorTask.cpp
+    ├── tests/
+    │   └── waveform/         ← Host-side waveform unit tests (Code::Blocks / MinGW)
+    │       ├── waveforms_standalone.h  ← Portable copy of wave_* functions
+    │       ├── main.cpp                ← Catch2 test cases (6 cases, 736 assertions)
+    │       └── WaveformTests.cbp       ← Code::Blocks project file
     └── components/
         └── crc16/            ← Shared CRC-16 (sourced from src/lib/CRC16)
             ├── CMakeLists.txt
             ├── CRC16.h
             └── CRC16.cpp
 ```
+
+### 2.4 NTRIP Client — JSON Sensor Input and MQTT Forwarding
+
+The NTRIP Client firmware includes a new function (provisionally named `sensorInputTask` or equivalent) that operates **in parallel with** the existing `dataOutputTask`. Its responsibilities are:
+
+1. **Receive** binary-framed JSON sensor packets on a dedicated UART RX pin (same SOH / DLE-stuffed payload / stuffed CRC-16 / CAN protocol defined in §3).
+2. **Validate** the CRC-16/CCITT-FALSE of each incoming frame; frames with a CRC mismatch are discarded and logged as errors.
+3. **Deserialise** the JSON payload, extracting all sensor fields defined in `sensorData.md`.
+4. **Publish** the sensor fields to the MQTT broker configured in the NTRIP Client (broker URL, port, topic, and credentials are `menuconfig` / `sdkconfig` settings in the NTRIP Client project — they are **not** part of the TelemetryEmulator firmware).
+
+The TelemetryEmulator's `sensorEmulatorTask` is the intended source for those frames. During integration testing it continuously transmits well-formed packets at 1 Hz (or a faster rate configured via `CONFIG_EMUL_PERIOD_MS`), and optionally corrupted ones via the BOOT button, so both the happy path and the CRC-error path of the NTRIP Client's new function can be exercised.
+
+> **Scope boundary:** Everything related to WiFi, MQTT broker connectivity, and topic naming is owned by the NTRIP Client project. This document only describes the wire interface and the frame format that the TelemetryEmulator presents to that function.
 
 ---
 
@@ -602,6 +621,11 @@ tests/TelemetryEmulator/
 │   ├── telemetryReceiverTask.cpp
 │   ├── sensorEmulatorTask.h
 │   └── sensorEmulatorTask.cpp
+├── tests/
+│   └── waveform/               ← Host-side waveform unit tests (MinGW / Code::Blocks)
+│       ├── waveforms_standalone.h  ← Portable copy of wave_* functions (no ESP-IDF)
+│       ├── main.cpp                ← Catch2 test cases (6 cases, 736 assertions)
+│       └── WaveformTests.cbp       ← Code::Blocks project file
 └── components/
     └── crc16/
         ├── CMakeLists.txt      ← idf_component_register(SRCS CRC16.cpp ...)
@@ -743,14 +767,65 @@ The BOOT button on the LOLIN S3 (GPIO0, active LOW) can be used at any time duri
 
 ### 10.5 Limitations
 
+- The single-board loopback test (GPIO4 ↔ GPIO5) only validates the emulator's own encode/decode cycle and CRC handling. It does **not** test the NTRIP Client's JSON reception or MQTT forwarding — that requires the two-board integration setup described in §11.
 - The loopback validates framing and CRC correctness but **not** payload content correctness — the receiver logs the raw JSON string but does not parse the field values.
-- The emitter runs at 1 Hz; the NTRIP Client transmits at 10 Hz. A 10 Hz stress test requires either a second board or a software change to `EMUL_PERIOD_MS`.
+- The emitter runs at 1 Hz by default; the NTRIP Client's `dataOutputTask` transmits at 10 Hz. A 10 Hz stress test requires either a second board or a software change to `CONFIG_EMUL_PERIOD_MS`.
 
 ---
 
-## 11. Open Issues / Future Work
+## 11. Two-Board Integration Test
+
+This section describes the full bilateral integration test: TelemetryEmulator ↔ NTRIP Client over two UART wires, with both directions exercised simultaneously and MQTT publication verified on the broker.
+
+### 11.1 Purpose
+
+| Direction | Source | Sink | What is tested |
+|-----------|--------|------|----------------|
+| Emulator → Client | `sensorEmulatorTask` (GPIO4 TX) | NTRIP Client sensor input function | JSON sensor data is correctly received, CRC-validated, and published to MQTT |
+| Client → Emulator | NTRIP Client `dataOutputTask` (GPIO15 TX) | `telemetryReceiverTask` (GPIO5 RX) | NTRIP Client telemetry frames are correctly framed with a valid CRC-16 |
+
+### 11.2 Hardware Setup
+
+Connect two wires and a shared GND between the boards (**do not** fit the single-board loopback wire GPIO4 → GPIO5):
+
+| Wire | From | To |
+|------|------|----|
+| Telemetry (Client → Emulator) | NTRIP Client GPIO15 (UART TX) | TelemetryEmulator GPIO5 (UART1 RX) |
+| Sensor data (Emulator → Client) | TelemetryEmulator GPIO4 (UART1 TX) | NTRIP Client GPIO\<n\> (UART RX — see NTRIP Client project) |
+| Ground | NTRIP Client GND | TelemetryEmulator GND |
+
+Both links operate at 115200 baud, 8N1.
+
+### 11.3 Expected Behaviour
+
+| Observation | Expected |
+|-------------|----------|
+| `TelemetryRx` log (Emulator monitor) | `Frame OK: ...` at the NTRIP Client's `dataOutputTask` rate (typically 10 Hz) |
+| `CRC FAIL` lines (Emulator monitor) | **None** during normal operation |
+| MQTT broker — sensor topic | One message per `sensorEmulatorTask` cycle (1 Hz default) containing all JSON fields from `sensorData.md` |
+| BOOT button held | `SensorEmul: CRC inject active` + NTRIP Client reports CRC error; MQTT publications pause for the duration |
+| BOOT button released | `Frame OK` and MQTT publications resume on the next packet |
+
+### 11.4 Procedure
+
+1. Flash the TelemetryEmulator firmware to LOLIN S3 #2 and the NTRIP Client firmware (with `sensorInputTask` enabled) to LOLIN S3 #1.
+2. Connect the two inter-board UART wires and shared GND as per §11.2.
+3. Ensure the NTRIP Client is connected to WiFi and the MQTT broker is reachable.
+4. Open the TelemetryEmulator USB serial monitor (`idf.py -p COM<n> monitor`).
+5. Subscribe to the sensor-data MQTT topic on the broker (e.g. with `mosquitto_sub` or MQTT Explorer).
+6. Power both boards.
+7. Verify `Frame OK` lines appear on the TelemetryEmulator monitor at the expected rate with `crc_err=0`.
+8. Verify sensor topic messages arrive on the broker at 1 Hz, each containing all expected JSON fields.
+9. Hold the BOOT button: confirm `CRC inject active` on the emulator monitor, CRC-error logging on the NTRIP Client, and a pause in MQTT publications.
+10. Release the button: confirm both `Frame OK` lines and MQTT publications resume on the next packet cycle.
+11. After at least 100 frames, verify the TelemetryEmulator statistics line shows the expected `crc_err` count from step 9 and `overflow=0`.
+
+---
+
+## 12. Open Issues / Future Work
 
 | # | Item | Priority |
 |---|------|----------|
-| 1 | Add a Catch2-based host-side unit test for the waveform generators in `sensorEmulatorTask` | Low |
-| 2 | ~~`CONFIG_EMUL_PERIOD_MS` sdkconfig option for JSON publish rate~~ — implemented: `main/Kconfig.projbuild` exposes the option; `sdkconfig.defaults` sets the default to 1000 ms | Closed |
+| 1 | **Set local time from received NTRIP Client frame.** `telemetryReceiverTask` already decodes the full CSV payload which contains a UTC timestamp (`YYYY-MM-DD HH:mm:ss.sss`, §3.3). Add a post-CRC-OK step that parses this timestamp and calls `settimeofday()` (POSIX) or `esp_sntp_set_sync_mode` / `adjtime()` to set the ESP32 system clock. This would give the TelemetryEmulator a GPS-disciplined time reference without requiring an SNTP server. | Medium |
+
+
