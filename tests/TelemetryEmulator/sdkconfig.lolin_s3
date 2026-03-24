@@ -592,6 +592,12 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
+# TelemetryEmulator
+#
+CONFIG_EMUL_PERIOD_MS=1000
+# end of TelemetryEmulator
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
