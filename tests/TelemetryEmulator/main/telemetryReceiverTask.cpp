@@ -4,42 +4,43 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
-#include "driver/gpio.h"
 #include "esp_log.h"
 
 #include "CRC16.h"
 
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
+#include "freertos/semphr.h"
 
-/* ── Configuration ────────────────────────────────────────────────────────── */
+/* Configuration */
 #define RECV_UART_NUM        UART_NUM_1
 #define RECV_RX_PIN          GPIO_NUM_5
 #define RECV_TX_PIN          GPIO_NUM_4       /* defined, not wired */
 #define RECV_BAUD_RATE       115200
 #define RECV_BUF_SIZE        1024
-#define RECV_FRAME_BUF_SIZE  256
+#define RECV_FRAME_BUF_SIZE  512  /* must be >= EMUL_JSON_BUF_SIZE + 2 CRC bytes */
 #define RECV_TASK_STACK_SIZE 4096
 #define RECV_TASK_PRIORITY   5
 
-/* ── Framing constants ────────────────────────────────────────────────────── */
-#define FRAME_SOH  0x01u
-#define FRAME_CAN  0x18u
-#define FRAME_DLE  0x10u
+#include "frame_protocol.h"
 
-/* ── Statistics reporting interval ──────────────────────────────────────────*/
+/* Statistics reporting interval */
 #define STATS_INTERVAL_FRAMES 100u
 
 static const char *TAG = "TelemetryRx";
 
-/* ── State machine ────────────────────────────────────────────────────────── */
+/* Shared lat/lon state */
+static SemaphoreHandle_t s_latlon_mutex = NULL;
+static NtripLatLon       g_latlon       = { 0.0, 0.0, "" };
+
+/* State machine */
 typedef enum {
     STATE_WAIT_SOH,
     STATE_IN_FRAME,
     STATE_AFTER_DLE,
 } frame_state_t;
 
-/* ─────────────────────────────────────────────────────────────────────────── */
 static void telemetry_receiver_task(void *arg)
 {
     ESP_LOGI(TAG, "Telemetry Receiver Task started, listening on UART1 RX=GPIO5");
@@ -69,7 +70,7 @@ static void telemetry_receiver_task(void *arg)
 
             switch (state) {
 
-            /* ── Waiting for start of frame ─────────────────────────────── */
+            /* Waiting for start of frame */
             case STATE_WAIT_SOH:
                 if (b == FRAME_SOH) {
                     frame_len = 0;
@@ -78,7 +79,7 @@ static void telemetry_receiver_task(void *arg)
                 /* Discard everything else */
                 break;
 
-            /* ── Accumulating frame bytes ────────────────────────────────── */
+            /* Accumulating frame bytes */
             case STATE_IN_FRAME:
                 if (b == FRAME_SOH) {
                     /* Unexpected SOH mid-frame — restart */
@@ -90,7 +91,7 @@ static void telemetry_receiver_task(void *arg)
                     state = STATE_AFTER_DLE;
 
                 } else if (b == FRAME_CAN) {
-                    /* ── End of frame received ─────────────────────────── */
+                    /* End of frame received */
                     ++frames_total;
 
                     if (frame_len < 2) {
@@ -119,6 +120,26 @@ static void telemetry_receiver_task(void *arg)
                         led_blink_green();
                         ESP_LOGI(TAG, "Frame OK: %s",
                                  reinterpret_cast<const char *>(frame_buf));
+                        /* Parse time/lat/lon from CSV payload */
+                        /* Format: YYYY-MM-DD HH:mm:ss.sss,LAT,LON,...          */
+                        {
+                            unsigned parsed_hh = 0, parsed_mm = 0, parsed_ss = 0, parsed_ms = 0;
+                            double parsed_lat = 0.0, parsed_lon = 0.0;
+                            if (sscanf(reinterpret_cast<const char *>(frame_buf),
+                                       "%*d-%*d-%*d %u:%u:%u.%u,%lf,%lf",
+                                       &parsed_hh, &parsed_mm, &parsed_ss, &parsed_ms,
+                                       &parsed_lat, &parsed_lon) == 6) {
+                                if (s_latlon_mutex) {
+                                    xSemaphoreTake(s_latlon_mutex, portMAX_DELAY);
+                                    g_latlon.lat = parsed_lat;
+                                    g_latlon.lon = parsed_lon;
+                                    snprintf(g_latlon.tim, sizeof(g_latlon.tim),
+                                             "%02u:%02u:%02u.%03u",
+                                             parsed_hh, parsed_mm, parsed_ss, parsed_ms);
+                                    xSemaphoreGive(s_latlon_mutex);
+                                }
+                            }
+                        }
                     } else {
                         ++frames_crc_err;
                         led_blink_red();
@@ -153,7 +174,7 @@ static void telemetry_receiver_task(void *arg)
                 }
                 break;
 
-            /* ── DLE escape: next byte is literal ────────────────────────── */
+            /* DLE escape: next byte is literal */
             case STATE_AFTER_DLE:
                 if (frame_len >= RECV_FRAME_BUF_SIZE) {
                     ++frames_overflow;
@@ -170,9 +191,14 @@ static void telemetry_receiver_task(void *arg)
     }
 }
 
-/* ─────────────────────────────────────────────────────────────────────────── */
 esp_err_t telemetry_receiver_task_init(void)
 {
+    s_latlon_mutex = xSemaphoreCreateMutex();
+    if (s_latlon_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create lat/lon mutex");
+        return ESP_FAIL;
+    }
+
     BaseType_t ret = xTaskCreate(
         telemetry_receiver_task,
         "telemetry_rx",
@@ -186,4 +212,15 @@ esp_err_t telemetry_receiver_task_init(void)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+NtripLatLon telemetry_receiver_get_latlon(void)
+{
+    NtripLatLon snapshot = { 0.0, 0.0, "" };
+    if (s_latlon_mutex) {
+        xSemaphoreTake(s_latlon_mutex, portMAX_DELAY);
+        snapshot = g_latlon;
+        xSemaphoreGive(s_latlon_mutex);
+    }
+    return snapshot;
 }

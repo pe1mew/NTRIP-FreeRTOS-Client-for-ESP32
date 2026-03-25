@@ -1,8 +1,8 @@
 # TelemetryEmulator — Design Document
 
 **Module:** `tests/TelemetryEmulator`
-**Version:** 4.1
-**Date:** 2026-03-23
+**Version:** 4.2
+**Date:** 2026-03-25
 **Author:** NTRIP FreeRTOS Client Project
 
 ---
@@ -21,7 +21,7 @@ The TelemetryEmulator is a standalone ESP32-S3 (LOLIN S3) firmware application t
 - Decode the binary framing protocol (byte de-stuffing, SOH/CAN boundary detection)
 - Validate each frame's CRC-16 checksum and report failures via `ESP_LOGE`
 - Log successfully decoded payloads via `ESP_LOGI` for visual confirmation
-- Generate deterministic JSON sensor-data packets every 1 second with signal values driven by periodic waveforms (sine, cosine, triangle, square, trapezoid, |sine|)
+- Generate deterministic JSON sensor-data packets every 1 second with signal values driven by periodic waveforms (sine, cosine, triangle, square, trapezoid)
 - Encode each packet as a binary frame (SOH + byte-stuffed payload + stuffed CRC-16 + CAN) and transmit it to the NTRIP Client over UART1 TX (GPIO4, 115200 baud)
 - Verify that the NTRIP Client correctly receives, CRC-validates, and publishes the sensor data to its configured MQTT broker
 - Act as a bilateral test harness: validate CRC of frames received **from** the NTRIP Client while simultaneously injecting test sensor data **to** the NTRIP Client
@@ -90,12 +90,14 @@ tests/
 └── TelemetryEmulator/
     ├── documentation/
     │   ├── design.md         ← This document
+    │   ├── json.md           ← JSON payload field reference and wire format
     │   └── sensorData.md     ← MQTT sensor data specification
     ├── CMakeLists.txt        ← ESP-IDF build
     ├── sdkconfig.defaults    ← Minimal ESP-IDF config
     ├── main/
     │   ├── CMakeLists.txt
     │   ├── main.cpp                  ← app_main()
+    │   ├── frame_protocol.h          ← Shared framing constants (SOH, CAN, DLE)
     │   ├── ledTask.h
     │   ├── ledTask.cpp               ← WS2812B RGB LED indicator task
     │   ├── telemetryReceiverTask.h
@@ -103,6 +105,10 @@ tests/
     │   ├── sensorEmulatorTask.h
     │   └── sensorEmulatorTask.cpp
     ├── tests/
+    │   ├── aggregatorClass/  ← Host-side Aggregator unit tests (Code::Blocks / MinGW)
+    │   │   ├── Aggregator.h          ← Header-only Aggregator class (authoritative copy)
+    │   │   ├── main.cpp              ← Catch2 test cases (11 cases, 63 assertions)
+    │   │   └── AggregatorTests.cbp   ← Code::Blocks project file
     │   └── waveform/         ← Host-side waveform unit tests (Code::Blocks / MinGW)
     │       ├── waveforms_standalone.h  ← Portable copy of wave_* functions
     │       ├── main.cpp                ← Catch2 test cases (6 cases, 736 assertions)
@@ -345,7 +351,7 @@ AFTER_DLE --> IN_FRAME  : any byte\n(append literal to buffer)
 ```
 
 **Buffer notes:**
-- Maximum frame buffer: 256 bytes (sufficient for the fixed-format payload + 2 CRC bytes)
+- Maximum frame buffer: 512 bytes (`RECV_FRAME_BUF_SIZE` — must be ≥ `EMUL_JSON_BUF_SIZE` + 2 CRC bytes)
 - On buffer overflow before `CAN`: discard frame, log `ESP_LOGW`, return to `WAIT_SOH`
 - The CRC bytes are the **last two bytes** appended before `CAN`; all preceding bytes are payload
 
@@ -426,16 +432,14 @@ esp_err_t telemetry_receiver_task_init(void);
 ```c
 #define RECV_UART_NUM        UART_NUM_1
 #define RECV_RX_PIN          GPIO_NUM_5
-#define RECV_TX_PIN          GPIO_NUM_4      // Defined but unused
+#define RECV_TX_PIN          GPIO_NUM_4      /* defined, not wired */
 #define RECV_BAUD_RATE       115200
 #define RECV_BUF_SIZE        1024
-#define RECV_FRAME_BUF_SIZE  256
+#define RECV_FRAME_BUF_SIZE  512  /* must be >= EMUL_JSON_BUF_SIZE + 2 CRC bytes */
 #define RECV_TASK_STACK_SIZE 4096
 #define RECV_TASK_PRIORITY   5
 
-#define FRAME_SOH   0x01
-#define FRAME_CAN   0x18
-#define FRAME_DLE   0x10
+#include "frame_protocol.h"  /* FRAME_SOH 0x01 / FRAME_CAN 0x18 / FRAME_DLE 0x10 */
 
 typedef enum {
     STATE_WAIT_SOH,
@@ -478,19 +482,16 @@ esp_err_t sensor_emulator_task_init(void);
 
 ```c
 #define EMUL_UART_NUM        UART_NUM_1   /* shared with telemetryReceiverTask */
-#define EMUL_JSON_BUF_SIZE   384          /* max JSON payload length            */
+#define EMUL_JSON_BUF_SIZE   512          /* max JSON payload length            */
 #define EMUL_WIRE_BUF_SIZE   (2 * EMUL_JSON_BUF_SIZE + 6)  /* worst-case frame */
 #define EMUL_TASK_STACK_SIZE   4096
 #define EMUL_TASK_PRIORITY     4
-#define EMUL_PERIOD_MS         1000u
+#define EMUL_PERIOD_MS         ((uint32_t)CONFIG_EMUL_PERIOD_MS)  /* Kconfig, default 1000 ms */
 
 /* CRC-inject button — LOLIN S3 BOOT button, active LOW, internal pull-up */
 #define EMUL_CRC_INJECT_PIN    GPIO_NUM_0
 
-/* Framing constants — identical to those in telemetryReceiverTask */
-#define FRAME_SOH  0x01u
-#define FRAME_CAN  0x18u
-#define FRAME_DLE  0x10u
+#include "frame_protocol.h"  /* FRAME_SOH 0x01 / FRAME_CAN 0x18 / FRAME_DLE 0x10 */
 ```
 
 > UART1 driver installation, baud rate, and pin assignment (TX=GPIO4) are performed exclusively by `app_main()`. `sensor_emulator_task_init()` configures GPIO0 as an input with pull-up and then creates the FreeRTOS task.
@@ -510,31 +511,31 @@ esp_err_t sensor_emulator_task_init(void);
 
 The byte-stuffing and CRC-16/CCITT-FALSE rules are **identical** to the protocol decoded by `telemetryReceiverTask` (see §3). The JSON payload is pure printable ASCII so control bytes (`0x01`, `0x10`, `0x18`) cannot appear in the payload in practice, but the stuffing loop handles them correctly regardless. The two CRC bytes are stuffed independently.
 
-**JSON output schema** (mirrors the MQTT payload defined in `sensorData.md`):
+**JSON output schema** (see `documentation/json.md` for the full field reference):
 
 ```json
 {"seq":N,"tim":"HH:MM:SS.mmm",
- "vhl":{"accX":...},"accY":...},"accZ":...},"thr":...},
- "mtr":{"pwr":...},"rpm":...},"trq":...},
- "spc":{"vsc":...},"tankP":...},"fan":...},"h2P1":...},"h2P2":...}}
+ "vhl":{"thr":{min,max,avg},"spd":{min,max,avg},"lat":F,"lon":F},
+ "mtr":{"pwr":{min,max,avg},"rpm":{min,max,avg},"trq":{min,max,avg}},
+ "spc":{"vsc":{min,max,avg},"fsa":{min,max,avg},"tankP":F}}
 ```
+
+`lat` and `lon` are scalars sourced from the most recent NTRIP-Client frame decoded by `telemetryReceiverTask`; all other fields are `{min, max, avg}` aggregates computed by Welford's algorithm over the publish window.
 
 **Waveform assignments:**
 
-| JSON key | Range | Waveform | Period |
-|----------|-------|----------|--------|
-| `accX` | −4096 … +4095 counts | sine | 5 s |
-| `accY` | −4096 … +4095 counts | cosine | 7 s |
-| `accZ` | −4096 … +4095 counts | triangle | 3 s |
-| `thr` | 0 … 100 % | trapezoid | 10 s |
-| `pwr` | −1000 … +1000 W | sine | 8 s |
-| `rpm` | −10000 … +10000 RPM | cosine | 12 s |
-| `trq` | −100 … +100 Nm | square | 6 s |
-| `vsc` | 0.0 … 100.0 V | triangle | 15 s |
-| `tankP` | 0.00 … 500.00 Bar | trapezoid | 20 s |
-| `fan` | 0 … 100 % | \|sine\| (rectified) | 10 s |
-| `h2P1` | 0.00 … 1.00 Bar | sine | 4 s |
-| `h2P2` | 0.00 … 1.00 Bar | cosine | 6 s |
+| JSON key | Range | Waveform | Period | Published as |
+|----------|-------|----------|--------|--------------|
+| `thr` | 0 … 100 % | trapezoid |  60 s | `{min, max, avg}` |
+| `spd` | 0.0 … 10.0 m/s | triangle | 120 s | `{min, max, avg}` |
+| `lat` | signed decimal ° | — | — | scalar (NTRIP receiver) |
+| `lon` | signed decimal ° | — | — | scalar (NTRIP receiver) |
+| `pwr` | −1000 … +1000 W | sine |  60 s | `{min, max, avg}` |
+| `rpm` | −10000 … +10000 RPM | cosine | 120 s | `{min, max, avg}` |
+| `trq` | −100 … +100 Nm | square |   6 s | `{min, max, avg}` |
+| `vsc` | 0.0 … 100.0 V | triangle |  15 s | `{min, max, avg}` |
+| `fsa` | 0.0 … 50.0 A | trapezoid |  12 s | `{min, max, avg}` |
+| `tankP` | 0.00 … 500.00 Bar | trapezoid | 240 s | scalar (latest) |
 
 **Waveform formulae** (continuous-time, all periods independent):
 
@@ -545,7 +546,6 @@ The byte-stuffing and CRC-16/CCITT-FALSE rules are **identical** to the protocol
 | Triangle | `mid + amp·(4φ−1)` if φ<0.5 else `mid + amp·(3−4φ)` where φ=mod(t,T)/T |
 | Square | `hi` if φ<0.5 else `lo` |
 | Trapezoid | 25% rise → 25% hold-high → 25% fall → 25% hold-low |
-| \|Sine\| | `lo + \|sin(2π·t/T)\|·(hi−lo)` — non-negative only |
 
 The time base uses `esp_timer_get_time()` (µs since boot), ensuring phase continuity and wakeup accuracy independent of FreeRTOS tick jitter. `vTaskDelayUntil` is used for the 1 Hz cadence.
 
@@ -585,7 +585,7 @@ All log output uses the standard `ESP_LOG` macros. The default log level is `INF
 
 | Event | Log level | Format |
 |-------|-----------|--------|
-| Task started | `INFO` | `"Sensor Emulator Task started — binary framed output on UART1 TX=GPIO4 @ 115200"` |
+| Task started | `INFO` | `"Sensor Emulator Task started — binary framed output on UART1 TX=GPIO4 @ 115200, sampled at %u ms"` |
 | Packet transmitted | `INFO` | `"seq=%u payload=%d wire=%d crc=0x%04X"` |
 | CRC inject active | `WARN` | `"CRC inject active — corrupting frame seq=%u"` |
 | JSON buffer overflow | `ERROR` | `"JSON buffer overflow at seq=%u (len=%d)"` |
@@ -609,12 +609,14 @@ All log output uses the standard `ESP_LOG` macros. The default log level is `INF
 tests/TelemetryEmulator/
 ├── documentation/
 │   ├── design.md               ← This document
+│   ├── json.md                 ← JSON payload field reference and wire format
 │   └── sensorData.md           ← MQTT sensor data specification
 ├── CMakeLists.txt              ← Top-level: cmake_minimum_required + project()
 ├── sdkconfig.defaults          ← Minimal config (log level, UART, no WiFi/BT)
 ├── main/
 │   ├── CMakeLists.txt          ← idf_component_register(SRCS main.cpp ...)
 │   ├── main.cpp
+│   ├── frame_protocol.h        ← Shared framing constants (SOH, CAN, DLE)
 │   ├── ledTask.h
 │   ├── ledTask.cpp             ← WS2812B RGB LED indicator task
 │   ├── telemetryReceiverTask.h
@@ -622,6 +624,10 @@ tests/TelemetryEmulator/
 │   ├── sensorEmulatorTask.h
 │   └── sensorEmulatorTask.cpp
 ├── tests/
+│   ├── aggregatorClass/        ← Host-side Aggregator unit tests (MinGW / Code::Blocks)
+│   │   ├── Aggregator.h            ← Header-only Aggregator class (authoritative copy)
+│   │   ├── main.cpp                ← Catch2 test cases (11 cases, 63 assertions)
+│   │   └── AggregatorTests.cbp     ← Code::Blocks project file
 │   └── waveform/               ← Host-side waveform unit tests (MinGW / Code::Blocks)
 │       ├── waveforms_standalone.h  ← Portable copy of wave_* functions (no ESP-IDF)
 │       ├── main.cpp                ← Catch2 test cases (6 cases, 736 assertions)
@@ -673,7 +679,7 @@ idf.py -p COM<n> flash monitor
 | Unexpected `SOH` mid-frame | Reset state machine, restart from new `SOH`, `ESP_LOGW` |
 | Frame buffer overflow | Discard frame, `ESP_LOGW`, increment `frames_overflow`, return to `WAIT_SOH` |
 | CRC mismatch | Log full details with `ESP_LOGE`, increment `frames_crc_error`, continue |
-| Payload not null-terminated | Emitter always produces ASCII payloads ≤ 140 bytes; receiver null-terminates after `CAN` |
+| Payload not null-terminated | Emitter always produces ASCII payloads well within `EMUL_JSON_BUF_SIZE` (512 bytes); receiver null-terminates after `CAN` |
 | JSON serialisation overflow | `ESP_LOGE`, packet skipped; sequence counter still incremented |
 
 ---
@@ -738,7 +744,7 @@ No NTRIP Client board is required. Both tasks run on the same LOLIN S3 #2.
 |-------------|----------|
 | `TelemetryRx` log after each emitter packet | `Frame OK: {"seq":N,...}` |
 | `TelemetryRx` CRC errors | **None** |
-| `TelemetryRx` buffer overflows | None (JSON payload ≤ ~250 bytes < 256-byte frame buffer) |
+| `TelemetryRx` buffer overflows | None (JSON payload well within 512-byte `RECV_FRAME_BUF_SIZE`) |
 | `SensorEmul` log per packet | `seq=N payload=P wire=W crc=0x????` (appears after `Frame OK`) |
 | Packet rate | 1 frame/second from emulator; both tasks log 1 line/second |
 | Log order per packet | `TelemetryRx: Frame OK` first, then `SensorEmul: seq=N` a few milliseconds later |

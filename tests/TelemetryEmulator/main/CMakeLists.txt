@@ -4,7 +4,7 @@ idf_component_register(
         "telemetryReceiverTask.cpp"
         "sensorEmulatorTask.cpp"
         "ledTask.cpp"
-    INCLUDE_DIRS "."
+    INCLUDE_DIRS "." "../tests/aggregatorClass"
     REQUIRES
         driver
         esp_timer

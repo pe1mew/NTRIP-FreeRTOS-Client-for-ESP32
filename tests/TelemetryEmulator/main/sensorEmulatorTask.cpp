@@ -14,18 +14,17 @@
 #include <stdint.h>
 
 #include "CRC16.h"
+#include "Aggregator.h"
+#include "telemetryReceiverTask.h"
 
 /* ── UART configuration ─────────────────────────────────────────────────── */
 /* Shares UART1 with telemetryReceiverTask (RX=GPIO5 / TX=GPIO4).            */
 /* The driver is installed and the pin is configured by app_main(); this      */
 /* task only calls uart_write_bytes().                                        */
 #define EMUL_UART_NUM        UART_NUM_1
-#define EMUL_JSON_BUF_SIZE   384             /* max JSON payload length       */
+#define EMUL_JSON_BUF_SIZE   512             /* max JSON payload length       */
 
-/* ── Binary framing constants (identical to telemetryReceiverTask) ────────── */
-#define FRAME_SOH  0x01u   /* Start of Header — never stuffed */
-#define FRAME_CAN  0x18u   /* Cancel / end of frame — never stuffed */
-#define FRAME_DLE  0x10u   /* Data Link Escape */
+#include "frame_protocol.h"
 
 /* Worst-case wire frame size:
  *   1 (SOH) + 2*EMUL_JSON_BUF_SIZE (full payload stuffed) + 4 (stuffed CRC) + 1 (CAN)
@@ -39,6 +38,8 @@
 /* Publish period is set via CONFIG_EMUL_PERIOD_MS in main/Kconfig.projbuild.
  * Default 1000 ms (1 Hz).  Override in sdkconfig or via idf.py menuconfig. */
 #define EMUL_PERIOD_MS         ((uint32_t)CONFIG_EMUL_PERIOD_MS)
+#define EMUL_SAMPLE_INTERVAL_MS  10u                               /* waveform sampling interval   */
+#define EMUL_SAMPLE_TICKS        (EMUL_PERIOD_MS / EMUL_SAMPLE_INTERVAL_MS) /* ticks per publish */
 
 /* ── CRC-inject button ───────────────────────────────────────────────────── */
 /* LOLIN S3 BOOT button — active LOW, internal pull-up enabled.              */
@@ -74,10 +75,6 @@ static const char *TAG = "SensorEmul";
  *   Symmetric: 25% rise │ 25% high │ 25% fall │ 25% low
  *   val ∈ [0,1] linearly interpolated per segment.
  *   output = lo + val*(hi-lo)
- *
- * === Rectified sine (|sin|) ===
- *   output = lo + |sin(2π·t/period)| * (hi-lo)
- *   Used for strictly non-negative signals whose physical minimum is 0.
  * ═══════════════════════════════════════════════════════════════════════════*/
 
 static inline float wave_sine(float t, float period, float lo, float hi)
@@ -126,45 +123,46 @@ static inline float wave_trapezoid(float t, float period, float lo, float hi)
     return lo + val * (hi - lo);
 }
 
-static inline float wave_abs_sine(float t, float period, float lo, float hi)
-{
-    return lo + fabsf(sinf(2.0f * (float)M_PI * t / period)) * (hi - lo);
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * Sensor Emulator Task
  *
+ * Samples all waveforms every EMUL_SAMPLE_INTERVAL_MS (10 ms) and feeds the
+ * Aggregator instances.  At each EMUL_PERIOD_MS (default 1 s) publish tick
+ * the accumulated min/max/avg snapshots are serialised into the JSON payload.
+ *
  * Signal assignments
  * ──────────────────────────────────────────────────────────────────────────
- * JSON key │ Range               │ Waveform       │ Period
- * ─────────┼─────────────────────┼────────────────┼────────
- * accX     │ -4096 … +4095 cnt   │ sine           │  5 s
- * accY     │ -4096 … +4095 cnt   │ cosine         │  7 s
- * accZ     │ -4096 … +4095 cnt   │ triangle       │  3 s
- * thr      │ 0 … 100 %           │ trapezoid      │ 10 s
- * pwr      │ -1000 … +1000 W     │ sine           │  8 s
- * rpm      │ -10000 … +10000 RPM │ cosine         │ 12 s
- * trq      │ -100 … +100 Nm      │ square         │  6 s
- * vsc      │ 0.0 … 100.0 V       │ triangle       │ 15 s
- * tankP    │ 0.00 … 500.00 Bar   │ trapezoid      │ 20 s
- * fan      │ 0 … 100 %           │ |sine|         │ 10 s
- * h2P1     │ 0.00 … 1.00 Bar     │ sine           │  4 s
- * h2P2     │ 0.00 … 1.00 Bar     │ cosine         │  6 s
+ * JSON key │ Range                │ Waveform  │ Period │ Published as
+ * ─────────┼──────────────────────┼───────────┼────────┼──────────────────
+ * thr      │ 0 … 100 %            │ trapezoid │  60 s  │ {min, max, avg}
+ * spd      │ 0.0 … 10.0 m/s       │ triangle  │ 120 s  │ {min, max, avg}
+ * lat      │ signed decimal °     │ —         │   —    │ scalar (NTRIP rx)
+ * lon      │ signed decimal °     │ —         │   —    │ scalar (NTRIP rx)
+ * pwr      │ -1000 … +1000 W      │ sine      │  60 s  │ {min, max, avg}
+ * rpm      │ -10000 … +10000 RPM  │ cosine    │ 120 s  │ {min, max, avg}
+ * trq      │ -100 … +100 Nm       │ square    │   6 s  │ {min, max, avg}
+ * vsc      │ 0.0 … 100.0 V        │ triangle  │  15 s  │ {min, max, avg}
+ * fsa      │ 0.0 … 50.0 A         │ trapezoid │  12 s  │ {min, max, avg}
+ * tankP    │ 0.00 … 500.00 Bar    │ trapezoid │ 240 s  │ scalar (latest)
  * ═══════════════════════════════════════════════════════════════════════════*/
 static void sensor_emulator_task(void *arg)
 {
-    ESP_LOGI(TAG, "Sensor Emulator Task started — binary framed output on UART1 TX=GPIO4 @ 115200");
+    ESP_LOGI(TAG, "Sensor Emulator Task started — binary framed output on UART1 TX=GPIO4 @ 115200, sampled at %u ms", EMUL_SAMPLE_INTERVAL_MS);
 
     char    json_buf[EMUL_JSON_BUF_SIZE];  /* raw JSON payload (unstuffed) */
     uint8_t wire[EMUL_WIRE_BUF_SIZE];      /* fully framed wire bytes      */
     uint32_t seq = 0;
 
+    /*  Aggregators — one per published {min, max, avg} field  */
+    Aggregator agg_thr, agg_spd, agg_pwr, agg_rpm, agg_trq, agg_vsc, agg_fsa;
+    uint32_t tick_count = 0;
+
     TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(EMUL_PERIOD_MS));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(EMUL_SAMPLE_INTERVAL_MS));
 
-        /* ── Time base ────────────────────────────────────────────────────── */
+        /*  Time base  */
         int64_t us = esp_timer_get_time();           /* µs since boot         */
         float   t  = (float)(us / 1000000LL)         /* whole seconds         */
                    + (float)(us % 1000000LL) * 1e-6f; /* fractional second    */
@@ -176,40 +174,79 @@ static void sensor_emulator_task(void *arg)
         uint32_t ss  = (ms_total /    1000UL) % 60UL;
         uint32_t ms  =  ms_total %    1000UL;
 
-        /* ── Vehicle block ────────────────────────────────────────────────── */
-        /* ADXL345 in ±16 g full-resolution mode: 13-bit signed raw counts   */
-        int16_t accX = (int16_t)wave_sine    (t,  5.0f, -4096.0f, 4095.0f);
-        int16_t accY = (int16_t)wave_cosine  (t,  7.0f, -4096.0f, 4095.0f);
-        int16_t accZ = (int16_t)wave_triangle(t,  3.0f, -4096.0f, 4095.0f);
-        uint8_t thr  = (uint8_t)wave_trapezoid(t, 10.0f,    0.0f,  100.0f);
+        /*  Sample waveforms and feed aggregators  */
+        agg_thr.add(wave_trapezoid(t,  60.0f,     0.0f,   100.0f));
+        agg_spd.add(wave_triangle (t, 120.0f,     0.0f,    10.0f));
+        agg_pwr.add(wave_sine     (t,  60.0f, -1000.0f,  1000.0f));
+        agg_rpm.add(wave_cosine   (t, 120.0f,-10000.0f, 10000.0f));
+        agg_trq.add(wave_square   (t,   6.0f,  -100.0f,   100.0f));
+        agg_vsc.add(wave_triangle (t,  15.0f,     0.0f,   100.0f));
+        agg_fsa.add(wave_trapezoid(t,  12.0f,     0.0f,    50.0f));
 
-        /* ── Motor block ──────────────────────────────────────────────────── */
-        int16_t pwr = (int16_t)wave_sine    (t,  8.0f, -1000.0f,  1000.0f);
-        float   rpm =          wave_cosine  (t, 12.0f,-10000.0f, 10000.0f);
-        int16_t trq = (int16_t)wave_square  (t,  6.0f,  -100.0f,   100.0f);
+        ++tick_count;
+        if (tick_count < EMUL_SAMPLE_TICKS) {
+            continue;
+        }
+        tick_count = 0;
 
-        /* ── Spectronik block ─────────────────────────────────────────────── */
-        float   vsc   = wave_triangle (t, 15.0f,   0.0f,  100.0f);
-        float   tankP = wave_trapezoid(t, 20.0f,   0.0f,  500.0f);
-        uint8_t fan   = (uint8_t)wave_abs_sine(t, 10.0f,  0.0f,  100.0f);
-        float   h2P1  = wave_sine    (t,  4.0f,   0.0f,    1.0f);
-        float   h2P2  = wave_cosine  (t,  6.0f,   0.0f,    1.0f);
+        /*  Publish tick  */
 
-        /* ── Serialise JSON payload ──────────────────────────────────────── */
+        /* Build timestamp string: use NTRIP wall clock if available, else boot-relative */
+        NtripLatLon pos = telemetry_receiver_get_latlon();
+        char boot_tim[13];
+        const char *tim_str;
+        if (pos.tim[0] != '\0') {
+            tim_str = pos.tim;
+        } else {
+            snprintf(boot_tim, sizeof(boot_tim), "%02u:%02u:%02u.%03u",
+                     (unsigned)hh, (unsigned)mm, (unsigned)ss, (unsigned)ms);
+            tim_str = boot_tim;
+        }
+
+        /*  Capture all aggregated windows  */
+        Aggregator::Snapshot s_thr = agg_thr.getSnapshot();
+        Aggregator::Snapshot s_spd = agg_spd.getSnapshot();
+        Aggregator::Snapshot s_pwr = agg_pwr.getSnapshot();
+        Aggregator::Snapshot s_rpm = agg_rpm.getSnapshot();
+        Aggregator::Snapshot s_trq = agg_trq.getSnapshot();
+        Aggregator::Snapshot s_vsc = agg_vsc.getSnapshot();
+        Aggregator::Snapshot s_fsa = agg_fsa.getSnapshot();
+        float tankP = wave_trapezoid(t, 240.0f, 0.0f, 500.0f);
+
+        /* Serialise JSON payload */
         int len = snprintf(json_buf, sizeof(json_buf),
             "{"
             "\"seq\":%u,"
-            "\"tim\":\"%02u:%02u:%02u.%03u\","
-            "\"vhl\":{\"accX\":%d,\"accY\":%d,\"accZ\":%d,\"thr\":%u},"
-            "\"mtr\":{\"pwr\":%d,\"rpm\":%.1f,\"trq\":%d},"
-            "\"spc\":{\"vsc\":%.1f,\"tankP\":%.2f,\"fan\":%u,"
-                     "\"h2P1\":%.2f,\"h2P2\":%.2f}"
+            "\"tim\":\"%s\","
+            "\"vhl\":{"
+                "\"thr\":{\"min\":%.1f,\"max\":%.1f,\"avg\":%.1f},"
+                "\"spd\":{\"min\":%.2f,\"max\":%.2f,\"avg\":%.2f},"
+                "\"lat\":%.7f,"
+                "\"lon\":%.7f"
+            "},"
+            "\"mtr\":{"
+                "\"pwr\":{\"min\":%.1f,\"max\":%.1f,\"avg\":%.1f},"
+                "\"rpm\":{\"min\":%.1f,\"max\":%.1f,\"avg\":%.1f},"
+                "\"trq\":{\"min\":%.1f,\"max\":%.1f,\"avg\":%.1f}"
+            "},"
+            "\"spc\":{"
+                "\"vsc\":{\"min\":%.1f,\"max\":%.1f,\"avg\":%.1f},"
+                "\"fsa\":{\"min\":%.2f,\"max\":%.2f,\"avg\":%.2f},"
+                "\"tankP\":%.2f"
+            "}"
             "}",
             (unsigned)seq,
-            (unsigned)hh, (unsigned)mm, (unsigned)ss, (unsigned)ms,
-            (int)accX, (int)accY, (int)accZ, (unsigned)thr,
-            (int)pwr, rpm, (int)trq,
-            vsc, tankP, (unsigned)fan, h2P1, h2P2);
+            tim_str,
+            /* vhl.thr */ s_thr.min, s_thr.max, s_thr.avg,
+            /* vhl.spd */ s_spd.min, s_spd.max, s_spd.avg,
+            /* vhl.lat */ pos.lat,
+            /* vhl.lon */ pos.lon,
+            /* mtr.pwr */ s_pwr.min, s_pwr.max, s_pwr.avg,
+            /* mtr.rpm */ s_rpm.min, s_rpm.max, s_rpm.avg,
+            /* mtr.trq */ s_trq.min, s_trq.max, s_trq.avg,
+            /* spc.vsc */ s_vsc.min, s_vsc.max, s_vsc.avg,
+            /* spc.fsa */ s_fsa.min, s_fsa.max, s_fsa.avg,
+            /* spc.tankP */ tankP);
 
         if (len <= 0 || len >= (int)sizeof(json_buf)) {
             ESP_LOGE(TAG, "JSON buffer overflow at seq=%u (len=%d)", (unsigned)seq, len);

@@ -36,7 +36,7 @@
  *
  * ### Reset semantics
  * getSnapshot() resets min_, max_, avg_, and count_ to their initial states.
- * getCount() is non-resetting and may be called at any time.
+ * 
  */
 
 #pragma once
@@ -97,6 +97,13 @@ public:
     /*!
      * @brief Manually reset without reading a snapshot.
      * Use this to discard a window without publishing.
+     *
+     * @note min_ is initialised to +∞ and max_ to −∞ (sentinel values).
+     * This ensures the very first call to add() always wins both comparisons:
+     * any finite sample value is less than +∞ (so min_ is updated) and
+     * greater than −∞ (so max_ is updated).  If getSnapshot() is called on
+     * an empty window the sentinels are returned as-is; the caller can detect
+     * this by checking Snapshot::count == 0.
      */
     void reset()
     {
@@ -107,8 +114,8 @@ public:
     }
 
 private:
-    float avg_;
-    float min_;
-    float max_;
-    int   count_;
+    float avg_;    ///< Running mean maintained by Welford's algorithm; 0.0f when window is empty.
+    float min_;    ///< Smallest sample seen in the current window; +∞ sentinel when window is empty.
+    float max_;    ///< Largest sample seen in the current window; −∞ sentinel when window is empty.
+    int   count_;  ///< Number of samples submitted since the last reset; 0 when window is empty.
 };
