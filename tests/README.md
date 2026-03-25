@@ -1,23 +1,47 @@
-# Unit Tests for espressiveFreeRTOS
+# Unit Tests for NTRIP FreeRTOS Client / Telemetry Emulator
 
-This directory contains unit tests for various modules of the espressiveFreeRTOS project using the Catch2 testing framework and Code::Blocks compiler.
+This directory contains unit tests for various modules of the project using the Catch2 testing framework and Code::Blocks compiler.
 
 ## Directory Structure
 
 ```
 tests/
-├── catch2/              # Catch2 single-header library
-│   └── catch.hpp       # Download from Catch2 releases
-├── NMEAparser/         # NMEA sentence parsing tests
+├── catch2/                        # Catch2 single-header library
+│   └── catch.hpp                 # Download from Catch2 releases
+├── NMEAparser/                   # NMEA sentence parsing tests
 │   ├── test_NMEAParser.cpp
 │   ├── NMEAParser_standalone.cpp/h
 │   ├── NMEAParser_Tests.cbp
 │   └── README.md
-├── CRC16/              # CRC-16/CCITT-FALSE checksum tests
+├── CRC16/                        # CRC-16/CCITT-FALSE checksum tests
 │   ├── main.cpp
 │   ├── CRC16_standalone.cpp/h
 │   └── CRC16_Tests.cbp
-└── .gitignore          # Excludes build artifacts
+├── TelemetryEmulator/            # ESP32 telemetry emulator project + host tests
+│   ├── CMakeLists.txt
+│   ├── platformio.ini
+│   ├── components/
+│   │   └── crc16/                # CRC16 ESP-IDF component
+│   ├── documentation/
+│   │   ├── design.md
+│   │   ├── json.md
+│   │   └── sensorData.md
+│   ├── main/                     # FreeRTOS application source
+│   │   ├── main.cpp
+│   │   ├── sensorEmulatorTask.cpp/h
+│   │   ├── telemetryReceiverTask.cpp/h
+│   │   ├── ledTask.cpp/h
+│   │   └── frame_protocol.h
+│   └── tests/                    # Host-side unit tests for TelemetryEmulator
+│       ├── aggregatorClass/      # Aggregator statistics class tests
+│       │   ├── Aggregator.h      # Header-only implementation under test
+│       │   ├── main.cpp
+│       │   └── AggregatorTests.cbp
+│       └── waveform/             # Waveform generator tests
+│           ├── waveforms_standalone.h
+│           ├── main.cpp
+│           └── WaveformTests.cbp
+└── .gitignore                    # Excludes build artifacts
 ```
 
 ## Prerequisites
@@ -48,6 +72,8 @@ This single file is required by all test projects.
 2. Go to **File → Open** and select the `.cbp` project file:
    - `NMEAparser/NMEAParser_Tests.cbp` for NMEA tests
    - `CRC16/CRC16_Tests.cbp` for CRC16 tests
+   - `TelemetryEmulator/tests/aggregatorClass/AggregatorTests.cbp` for Aggregator tests
+   - `TelemetryEmulator/tests/waveform/WaveformTests.cbp` for Waveform tests
 3. Select **Build → Build** (F9)
 4. Select **Build → Run** (Ctrl+F10)
 5. View test results in the console
@@ -68,6 +94,20 @@ NMEAParser_Tests.exe
 cd tests/CRC16
 g++ -std=c++11 -Wall -o CRC16_Tests.exe CRC16_standalone.cpp main.cpp
 CRC16_Tests.exe
+```
+
+**For Aggregator tests:**
+```bash
+cd tests/TelemetryEmulator/tests/aggregatorClass
+g++ -std=c++11 -Wall -o AggregatorTests.exe main.cpp
+AggregatorTests.exe
+```
+
+**For Waveform tests:**
+```bash
+cd tests/TelemetryEmulator/tests/waveform
+g++ -std=c++11 -Wall -o WaveformTests.exe main.cpp
+WaveformTests.exe
 ```
 
 ## Test Modules
@@ -114,6 +154,46 @@ Tests CRC-16/CCITT-FALSE checksum calculation used for data integrity.
 
 **Verification:** Use https://crccalc.com/ to verify expected values
 
+### 3. Aggregator Tests
+
+Tests the `Aggregator` header-only class used by `sensorEmulatorTask` to compute per-window statistics (min, max, running mean) before serialising sensor data to JSON.
+
+**Implementation:** `TelemetryEmulator/tests/aggregatorClass/Aggregator.h`  
+**Algorithm:** Welford's online algorithm for numerically stable incremental mean.
+
+**Test Coverage:**
+- ✓ Initial/empty state (avg = 0, min = +∞, max = −∞, count = 0)
+- ✓ Single value: snapshot avg == min == max == value
+- ✓ Two values: correct mean, min, max, and count
+- ✓ Multiple identical values: mean unchanged, min == max
+- ✓ Mixed positive/negative values
+- ✓ Welford accuracy for a known integer sequence
+- ✓ `getSnapshot()` atomically resets all accumulators
+- ✓ `reset()` mid-stream
+- ✓ Large sample count (1000 uniform values)
+- ✓ Alternating positive/negative cancellation
+- ✓ Two consecutive 1-second windows
+
+**See:** [TelemetryEmulator/tests/aggregatorClass/aggregatorClass.md](TelemetryEmulator/tests/aggregatorClass/aggregatorClass.md) for full class reference
+
+### 4. Waveform Tests
+
+Tests the six waveform generator functions defined in `sensorEmulatorTask` via the portable stub `waveforms_standalone.h`. No ESP-IDF headers required.
+
+**Waveforms under test:**
+- `wave_sine` — midpoint + amplitude · sin(2π·t/T)
+- `wave_cosine` — midpoint + amplitude · cos(2π·t/T)
+- `wave_triangle` — symmetric triangle, 4-segment linear
+- `wave_square` — 50% duty cycle, instantaneous transitions
+- `wave_trapezoid` — 25% rise | 25% hold-hi | 25% fall | 25% hold-lo
+- `wave_abs_sine` — lo + |sin(2π·t/T)| · (hi − lo), non-negative
+
+**Test Coverage:**
+- ✓ Known sample points at extrema, zero crossings, and inflection points
+- ✓ Full-period periodicity for each waveform
+- ✓ Boundary values (t = 0, t = T/4, t = T/2, t = 3T/4, t = T)
+- ✓ Float comparisons use `Approx()` with 1% relative tolerance
+
 ## Expected Test Output
 
 When all tests pass, you should see:
@@ -145,6 +225,8 @@ The `.gitignore` file excludes:
 These tests use **standalone implementations** of the code:
 - `NMEAParser_standalone.cpp` is a copy of `src/NMEAparser/NMEAParser.cpp`
 - `CRC16_standalone.cpp` is a copy of `src/lib/CRC16.cpp`
+- `TelemetryEmulator/tests/aggregatorClass/Aggregator.h` is the header-only class shared with `TelemetryEmulator/main/`
+- `TelemetryEmulator/tests/waveform/waveforms_standalone.h` is a portable stub exposing the waveform functions from `TelemetryEmulator/main/sensorEmulatorTask.cpp`
 
 This approach ensures:
 1. Tests compile independently without ESP-IDF dependencies
