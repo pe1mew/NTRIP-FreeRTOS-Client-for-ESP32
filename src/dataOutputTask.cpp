@@ -17,9 +17,11 @@
 #include "configurationManagerTask.h"
 #include "hardware_config.h"
 #include "lib/CRC16.h"
+#include "statisticsTask.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/event_groups.h>
+#include <freertos/queue.h>
 #include <driver/uart.h>
 #include <driver/gpio.h>
 #include <esp_log.h>
@@ -32,6 +34,9 @@ static const char *TAG = "DataOutputTask";
 
 // Task handle
 static TaskHandle_t data_output_task_handle = NULL;
+
+// Queue for forwarding received telemetry JSON to the MQTT task
+static QueueHandle_t s_json_queue = NULL;
 
 // UART configuration
 #define OUTPUT_UART_NUM         TELEMETRY_UART_NUM
@@ -107,6 +112,97 @@ static size_t build_telemetry_frame(const position_data_t* pos, uint8_t* frame, 
     frame[pos_out++] = FRAME_CAN;
 
     return pos_out;
+}
+
+/**
+ * @brief Receive and decode any pending UART1 RX frames, forwarding valid JSON to the queue.
+ *
+ * Uses a persistent state machine so partial frames are carried across calls.
+ * Call once per task iteration (non-blocking — reads only bytes already in the UART FIFO).
+ */
+static void process_rx_frames(void) {
+    // Receive state machine (static = persists across calls)
+    typedef enum { WAIT_SOH, READING } rx_state_t;
+    static rx_state_t state = WAIT_SOH;
+    // Worst case: 512 payload bytes each stuffed → 1024 + 4 CRC bytes = ~1028 destuffed bytes.
+    // We accumulate destuffed bytes so the buffer only needs payload + 2 CRC bytes.
+    static uint8_t buf[TELEMETRY_JSON_MAX_LEN + 4];
+    static size_t buf_len = 0;
+    static bool dle_pending = false;
+
+    uint8_t b;
+    while (uart_read_bytes(OUTPUT_UART_NUM, &b, 1, 0) == 1) {
+        if (state == WAIT_SOH) {
+            if (b == FRAME_SOH) {
+                buf_len = 0;
+                dle_pending = false;
+                state = READING;
+            }
+            // discard anything else
+        } else { // READING
+            if (dle_pending) {
+                // This byte is a literal data value regardless of its value
+                dle_pending = false;
+                if (buf_len < sizeof(buf)) {
+                    buf[buf_len++] = b;
+                } else {
+                    // Buffer overflow — discard frame
+                    ESP_LOGW(TAG, "RX frame buffer overflow, discarding");
+                    state = WAIT_SOH;
+                }
+            } else if (b == FRAME_DLE) {
+                dle_pending = true;
+            } else if (b == FRAME_CAN) {
+                // End of frame — validate and forward
+                // Need at least 3 bytes: 1 payload byte + 2 CRC bytes
+                if (buf_len >= 3) {
+                    size_t payload_len = buf_len - 2;
+                    uint8_t crc_h = buf[payload_len];
+                    uint8_t crc_l = buf[payload_len + 1];
+                    uint16_t received_crc = ((uint16_t)crc_h << 8) | crc_l;
+                    uint16_t calculated_crc = calculateCRC16(buf, payload_len);
+
+                    if (calculated_crc == received_crc) {
+                        // Valid CRC — ensure payload is a JSON object (starts with '{').
+                        // This guards against looped-back CSV frames that share our framing
+                        // format and whose CRC therefore also passes validation.
+                        if (payload_len == 0 || buf[0] != '{') {
+                            ESP_LOGD(TAG, "RX frame CRC ok but payload is not JSON (0x%02X), discarding", payload_len > 0 ? buf[0] : 0);
+                        } else {
+                        statistics_telemetry_received(true);
+                        if (s_json_queue != NULL && payload_len < TELEMETRY_JSON_MAX_LEN) {
+                            telemetry_json_msg_t msg;
+                            memcpy(msg.json, buf, payload_len);
+                            msg.json[payload_len] = '\0';
+                            msg.len = payload_len;
+                            if (xQueueSend(s_json_queue, &msg, 0) != pdTRUE) {
+                                ESP_LOGD(TAG, "Telemetry JSON queue full, dropping frame");
+                            }
+                        }
+                        }
+                    } else {
+                        ESP_LOGD(TAG, "RX frame CRC mismatch (got 0x%04X, expected 0x%04X)",
+                                 received_crc, calculated_crc);
+                        statistics_telemetry_received(false);
+                    }
+                } else {
+                    ESP_LOGD(TAG, "RX frame too short (%d bytes), discarding", (int)buf_len);
+                }
+                state = WAIT_SOH;
+            } else if (b == FRAME_SOH) {
+                // Unexpected SOH — restart frame
+                buf_len = 0;
+                dle_pending = false;
+            } else {
+                if (buf_len < sizeof(buf)) {
+                    buf[buf_len++] = b;
+                } else {
+                    ESP_LOGW(TAG, "RX frame buffer overflow, discarding");
+                    state = WAIT_SOH;
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -258,13 +354,27 @@ static void data_output_task(void* pvParameters) {
         } else {
             ESP_LOGW(TAG, "Failed to build telemetry frame");
         }
+
+        // Process any incoming JSON frames from the telemetry unit on UART1 RX
+        process_rx_frames();
     }
 }
 
 // Public API Implementation
 
+QueueHandle_t data_output_get_json_queue(void) {
+    return s_json_queue;
+}
+
 esp_err_t data_output_task_init(void) {
     ESP_LOGI(TAG, "Initializing Data Output Task");
+
+    // Create JSON forwarding queue (depth 5, each item is a telemetry_json_msg_t)
+    s_json_queue = xQueueCreate(5, sizeof(telemetry_json_msg_t));
+    if (s_json_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create telemetry JSON queue");
+        return ESP_FAIL;
+    }
 
     // Create Data Output task
     BaseType_t result = xTaskCreate(

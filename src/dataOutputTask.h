@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <esp_err.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,8 +56,21 @@ extern "C" {
 #define FRAME_DLE   0x10
 
 /**
- * @brief Data output configuration structure
+ * @brief Maximum length of a telemetry JSON payload (de-stuffed, without framing).
  */
+#define TELEMETRY_JSON_MAX_LEN  512
+
+/**
+ * @brief Message struct passed through the JSON forwarding queue.
+ *
+ * Populated by the data output task on successful UART1 RX frame receipt and
+ * consumed by the MQTT client task for publishing to the /live topic.
+ */
+typedef struct {
+    char json[TELEMETRY_JSON_MAX_LEN]; /**< Null-terminated JSON string */
+    size_t len;                         /**< Length of the JSON string */
+} telemetry_json_msg_t;
+
 /**
  * @brief Data output configuration structure.
  */
@@ -120,6 +135,16 @@ esp_err_t data_output_task_init(void);
  * @return ESP_OK on success
  */
 esp_err_t data_output_task_stop(void);
+
+/**
+ * @brief Get the telemetry JSON forwarding queue handle.
+ *
+ * The queue carries telemetry_json_msg_t items decoded from UART1 RX frames.
+ * Must be called after data_output_task_init().
+ *
+ * @return QueueHandle_t queue handle, or NULL if not initialized
+ */
+QueueHandle_t data_output_get_json_queue(void);
 
 #ifdef __cplusplus
 }

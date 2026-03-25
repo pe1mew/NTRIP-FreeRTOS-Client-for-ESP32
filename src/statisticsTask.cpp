@@ -541,6 +541,20 @@ void statistics_gga_sent(bool success) {
 }
 
 /**
+ * @brief Update telemetry JSON receive counter
+ */
+void statistics_telemetry_received(bool crc_ok) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (crc_ok) {
+            stats.runtime.telemetry_json_received++;
+        } else {
+            stats.runtime.telemetry_json_crc_fail++;
+        }
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
  * @brief Format statistics as JSON string
  */
 int statistics_format_json(char* buffer, size_t buffer_size) {
@@ -579,6 +593,10 @@ int statistics_format_json(char* buffer, size_t buffer_size) {
             "\"uptime_percent\":%.1f,"
             "\"rssi_dbm\":%d,"
             "\"reconnects\":%lu"
+        "},"
+        "\"telemetry\":{"
+            "\"json_received\":%lu,"
+            "\"json_crc_fail\":%lu"
         "}"
         "}",
         local_stats.runtime.system_uptime_sec,
@@ -597,7 +615,9 @@ int statistics_format_json(char* buffer, size_t buffer_size) {
         local_stats.period.rtcm_message_rate,
         local_stats.period.wifi_uptime_percent,
         local_stats.period.wifi_rssi_dbm,
-        local_stats.runtime.wifi_reconnect_count_total
+        local_stats.runtime.wifi_reconnect_count_total,
+        local_stats.runtime.telemetry_json_received,
+        local_stats.runtime.telemetry_json_crc_fail
     );
     
     return (len > 0 && (size_t)len < buffer_size) ? len : -1;

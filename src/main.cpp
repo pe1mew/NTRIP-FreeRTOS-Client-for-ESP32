@@ -108,7 +108,7 @@ extern "C" void app_main(void) {
     // ========================================
     // Step 10: Initialize MQTT Client Task
     // ========================================
-    ret = mqtt_client_task_init();
+    ret = mqtt_client_task_init(data_output_get_json_queue());
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "MQTT Client Task initialization failed or disabled: %s", esp_err_to_name(ret));
     } else {

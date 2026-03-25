@@ -4,6 +4,7 @@
 #include "statisticsTask.h"
 #include "wifiManager.h"
 #include "ntripClientTask.h"
+#include "dataOutputTask.h"
 
 #include "ledIndicatorTask.h"
 
@@ -11,6 +12,7 @@
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -20,6 +22,9 @@ static const char *TAG = "MQTT_CLIENT";
 
 // Task handle
 static TaskHandle_t mqtt_task_handle = NULL;
+
+// Queue for forwarding telemetry JSON received on UART1 RX
+static QueueHandle_t s_telemetry_json_queue = NULL;
 
 // MQTT client handle
 static esp_mqtt_client_handle_t mqtt_client = NULL;
@@ -42,9 +47,11 @@ static void collect_system_status(mqtt_status_message_t *msg);
 static void collect_period_statistics(mqtt_stats_message_t *msg);
 
 // Initialize MQTT client task
-esp_err_t mqtt_client_task_init(void) {
+esp_err_t mqtt_client_task_init(QueueHandle_t telemetry_json_queue) {
     ESP_LOGI(TAG, "Initializing MQTT client task");
-    
+
+    s_telemetry_json_queue = telemetry_json_queue;
+
     // Create MQTT task
     BaseType_t result = xTaskCreate(
         mqtt_task,
@@ -444,6 +451,30 @@ static void mqtt_task(void *pvParameters) {
             } else {
                 ESP_LOGE(TAG, "Failed to publish stats message");
             }
+        }
+
+        // Forward telemetry JSON from UART1 RX to {topic}/live (drain the whole queue each tick)
+        if (s_telemetry_json_queue != NULL && config.telemetry_forward_enabled) {
+            telemetry_json_msg_t json_msg;
+            while (xQueueReceive(s_telemetry_json_queue, &json_msg, 0) == pdTRUE) {
+                if (mqtt_connected) {
+                    char live_topic[160];
+                    snprintf(live_topic, sizeof(live_topic), "%s/live", config.topic);
+                    int msg_id = esp_mqtt_client_publish(mqtt_client, live_topic, json_msg.json, json_msg.len, 0, 0);
+                    if (msg_id >= 0) {
+                        total_published++;
+                        led_update_mqtt_activity();
+                        ESP_LOGD(TAG, "Published telemetry JSON to %s (%d bytes)", live_topic, (int)json_msg.len);
+                    } else {
+                        ESP_LOGW(TAG, "Failed to publish telemetry JSON to %s", live_topic);
+                    }
+                }
+                // If not connected or forwarding disabled mid-drain: item already dequeued, drop it
+            }
+        } else if (s_telemetry_json_queue != NULL && !config.telemetry_forward_enabled) {
+            // Forwarding disabled — drain the queue to prevent it filling up
+            telemetry_json_msg_t json_msg;
+            while (xQueueReceive(s_telemetry_json_queue, &json_msg, 0) == pdTRUE) { /* discard */ }
         }
     }
 }

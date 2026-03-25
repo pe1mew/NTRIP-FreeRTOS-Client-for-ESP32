@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <time.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -91,13 +93,15 @@ typedef struct {
 
 /**
  * @brief Initialize and start the MQTT client task
- * 
+ *
  * Creates the FreeRTOS task for MQTT client operations.
  * Reads configuration from NVS and establishes connection to broker.
- * 
+ *
+ * @param telemetry_json_queue Queue of telemetry_json_msg_t items from the data output task.
+ *                             Pass NULL to disable live telemetry forwarding entirely.
  * @return ESP_OK on success, error code otherwise
  */
-esp_err_t mqtt_client_task_init(void);
+esp_err_t mqtt_client_task_init(QueueHandle_t telemetry_json_queue);
 
 /**
  * @brief Stop the MQTT client task

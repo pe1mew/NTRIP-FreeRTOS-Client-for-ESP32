@@ -45,10 +45,11 @@ typedef struct {
     char topic[64];
     char user[32];
     char password[64];
-    uint16_t gnss_interval_sec;    // Default: 10
-    uint16_t status_interval_sec;  // Default: 120
-    uint16_t stats_interval_sec;   // Default: 60
-    bool enabled;                  // Default: true
+    uint16_t gnss_interval_sec;         // Default: 10
+    uint16_t status_interval_sec;       // Default: 120
+    uint16_t stats_interval_sec;        // Default: 60
+    bool enabled;                       // Default: true
+    bool telemetry_forward_enabled;     // Forward telemetry JSON to MQTT /live topic. Default: true
 } mqtt_config_t;
 
 // Application configuration structure (combined)

@@ -239,6 +239,9 @@ static const char* html_page =
 "            <label>Stats Interval (sec, 0=disabled):</label>\n"
 "            <input type='number' id='mqtt_stats_interval' min='0' max='600' value='60'>\n"
 "        </div>\n"
+"        <div class='form-group'>\n"
+"            <label><input type='checkbox' id='mqtt_telemetry_forward' checked> Forward Telemetry JSON to MQTT (<code>{topic}/live</code>)</label>\n"
+"        </div>\n"
 "        <div style='margin-top: 30px;'>\n"
 "            <button onclick='saveConfig()'>Save Configuration</button>\n"
 "            <button onclick='restartDevice()'>Restart Device</button>\n"
@@ -332,6 +335,7 @@ static const char* html_page =
 "                document.getElementById('mqtt_gnss_interval').value = data.mqtt.gnss_interval_sec;\n"
 "                document.getElementById('mqtt_status_interval').value = data.mqtt.status_interval_sec;\n"
 "                document.getElementById('mqtt_stats_interval').value = data.mqtt.stats_interval_sec;\n"
+"                document.getElementById('mqtt_telemetry_forward').checked = data.mqtt.telemetry_forward_enabled !== false;\n"
 "            }).catch(e => showStatus('Failed to load configuration', 'error'));\n"
 "        }\n"
 "        function saveConfig() {\n"
@@ -352,7 +356,8 @@ static const char* html_page =
 "                        user: document.getElementById('mqtt_user').value, password: document.getElementById('mqtt_password').value,\n"
 "                        gnss_interval_sec: parseInt(document.getElementById('mqtt_gnss_interval').value),\n"
 "                        status_interval_sec: parseInt(document.getElementById('mqtt_status_interval').value),\n"
-"                        stats_interval_sec: parseInt(document.getElementById('mqtt_stats_interval').value) }\n"
+"                        stats_interval_sec: parseInt(document.getElementById('mqtt_stats_interval').value),\n"
+"                        telemetry_forward_enabled: document.getElementById('mqtt_telemetry_forward').checked }\n"
 "            };\n"
 "            fetch('/api/config', { method: 'POST', headers: Object.assign({'Content-Type': 'application/json'}, getAuthHeaders()), body: JSON.stringify(config) })\n"
 "            .then(r => { if (r.status === 401) { logout(); return Promise.reject('Unauthorized'); } return r.json(); })\n"
@@ -583,6 +588,7 @@ static esp_err_t api_config_get_handler(httpd_req_t *req) {
     cJSON_AddNumberToObject(mqtt, "status_interval_sec", config.mqtt.status_interval_sec);
     cJSON_AddNumberToObject(mqtt, "stats_interval_sec", config.mqtt.stats_interval_sec);
     cJSON_AddBoolToObject(mqtt, "enabled", config.mqtt.enabled);
+    cJSON_AddBoolToObject(mqtt, "telemetry_forward_enabled", config.mqtt.telemetry_forward_enabled);
     cJSON_AddItemToObject(root, "mqtt", mqtt);
     
     char *json_string = cJSON_Print(root);
@@ -709,7 +715,8 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
         cJSON *gnss_interval = cJSON_GetObjectItem(mqtt, "gnss_interval_sec");
         cJSON *status_interval = cJSON_GetObjectItem(mqtt, "status_interval_sec");
         cJSON *stats_interval = cJSON_GetObjectItem(mqtt, "stats_interval_sec");
-        
+        cJSON *tel_fwd = cJSON_GetObjectItem(mqtt, "telemetry_forward_enabled");
+
         if (enabled && cJSON_IsBool(enabled)) { config.mqtt.enabled = cJSON_IsTrue(enabled); mqtt_changed = true; }
         if (broker && cJSON_IsString(broker)) { strncpy(config.mqtt.broker, broker->valuestring, sizeof(config.mqtt.broker) - 1); mqtt_changed = true; }
         if (port && cJSON_IsNumber(port)) { config.mqtt.port = port->valueint; mqtt_changed = true; }
@@ -734,8 +741,9 @@ static esp_err_t api_config_post_handler(httpd_req_t *req) {
         if (gnss_interval && cJSON_IsNumber(gnss_interval)) { config.mqtt.gnss_interval_sec = gnss_interval->valueint; mqtt_changed = true; }
         if (status_interval && cJSON_IsNumber(status_interval)) { config.mqtt.status_interval_sec = status_interval->valueint; mqtt_changed = true; }
         if (stats_interval && cJSON_IsNumber(stats_interval)) { config.mqtt.stats_interval_sec = stats_interval->valueint; mqtt_changed = true; }
+        if (tel_fwd && cJSON_IsBool(tel_fwd)) { config.mqtt.telemetry_forward_enabled = cJSON_IsTrue(tel_fwd); mqtt_changed = true; }
     }
-    
+
     cJSON_Delete(root);
     
     // Save only what changed to avoid unnecessary reconnections

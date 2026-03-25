@@ -17,8 +17,8 @@ Each JSON field that carries a `{min, max, avg}` sub-object (see `documentation/
 Calling separate `getMin()`, `getMax()`, and `getAvg()` methods creates a **race window** between each call: an ISR or another RTOS task could invoke `add()` between calls, making min/max belong to a different sample population than avg. `getSnapshot()` copies all four fields and resets in a **single call**, so the caller only needs one critical-section guard around that one call:
 
 ```cpp
-// FreeRTOS                               |  bare-metal / ISR
-xSemaphoreTake(mutex, portMAX_DELAY);     |  __disable_irq();
+// FreeRTOS                              |  bare-metal / ISR
+xSemaphoreTake(mutex, portMAX_DELAY);    |  __disable_irq();
 auto s = agg.getSnapshot();              |  auto s = agg.getSnapshot();
 xSemaphoreGive(mutex);                   |  __enable_irq();
 ```

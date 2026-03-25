@@ -52,7 +52,8 @@ static const app_config_t default_config = {
         .gnss_interval_sec = 10,
         .status_interval_sec = 120,
         .stats_interval_sec = 60,
-        .enabled = false  // Disabled by default until configured
+        .enabled = false,  // Disabled by default until configured
+        .telemetry_forward_enabled = true
     }
 };
 
@@ -291,6 +292,11 @@ static esp_err_t nvs_load_mqtt(mqtt_config_t* config) {
         config->enabled = (enabled != 0);
     }
 
+    uint8_t tel_fwd;
+    if (nvs_get_u8(handle, "tel_fwd_en", &tel_fwd) == ESP_OK) {
+        config->telemetry_forward_enabled = (tel_fwd != 0);
+    }
+
     nvs_close(handle);
     ESP_LOGI(TAG, "MQTT config loaded from NVS");
     return ESP_OK;
@@ -318,6 +324,7 @@ static esp_err_t nvs_save_mqtt(const mqtt_config_t* config) {
     nvs_set_u16(handle, "status_interval", config->status_interval_sec);
     nvs_set_u16(handle, "stats_interval", config->stats_interval_sec);
     nvs_set_u8(handle, "enabled", config->enabled ? 1 : 0);
+    nvs_set_u8(handle, "tel_fwd_en", config->telemetry_forward_enabled ? 1 : 0);
 
     err = nvs_commit(handle);
     if (err != ESP_OK) {

@@ -88,6 +88,9 @@ typedef struct {
     uint32_t config_load_failures_total;      /**< Total config load failures */
     uint32_t memory_alloc_failures_total;     /**< Total memory allocation failures */
     uint32_t task_creation_failures_total;    /**< Total task creation failures */
+    // Telemetry JSON forwarding counters [Runtime]
+    uint32_t telemetry_json_received;         /**< Total valid telemetry JSON frames received on UART1 RX */
+    uint32_t telemetry_json_crc_fail;         /**< Total CRC failures on UART1 RX telemetry frames */
 } runtime_statistics_t;
 
 /**
@@ -227,10 +230,17 @@ void statistics_fix_quality_changed(uint8_t new_quality);
 
 /**
  * @brief Update GGA transmission counter (called by NTRIP task)
- * 
+ *
  * @param success true if sent successfully, false if failed
  */
 void statistics_gga_sent(bool success);
+
+/**
+ * @brief Update telemetry JSON receive counter (called by data output task)
+ *
+ * @param crc_ok true if frame CRC was valid, false if CRC failed
+ */
+void statistics_telemetry_received(bool crc_ok);
 
 /**
  * @brief Format statistics as JSON string
