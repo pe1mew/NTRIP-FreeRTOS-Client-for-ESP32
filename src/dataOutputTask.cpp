@@ -348,6 +348,7 @@ static void data_output_task(void* pvParameters) {
             int written = uart_write_bytes(OUTPUT_UART_NUM, frame_buffer, frame_len);
             if (written < 0) {
                 ESP_LOGW(TAG, "Failed to write telemetry data to UART");
+                statistics_uart_error();
             } else {
                 ESP_LOGD(TAG, "Transmitted %d bytes (valid=%d)", written, position.valid);
             }

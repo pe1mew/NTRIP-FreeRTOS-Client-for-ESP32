@@ -36,6 +36,26 @@ static bool ntrip_connected = false;
 static time_t ntrip_connection_start = 0;
 static uint32_t ntrip_uptime_accumulated = 0;
 
+// RTCM quality monitoring
+static uint64_t last_rtcm_time = 0;
+#define RTCM_GAP_THRESHOLD_MS 5000  // 5 seconds without RTCM = data gap
+
+// Reference station position tracking
+typedef struct {
+    double ecef_x;      // ECEF X coordinate (meters)
+    double ecef_y;      // ECEF Y coordinate (meters)
+    double ecef_z;      // ECEF Z coordinate (meters)
+    uint64_t last_update_time;  // Timestamp of last update
+    bool valid;         // Whether we have valid reference station data
+} reference_station_t;
+
+static reference_station_t reference_station = {0, 0, 0, 0, false};
+
+// RTCM frame parser state
+#define RTCM_BUFFER_SIZE 2048
+static uint8_t rtcm_buffer[RTCM_BUFFER_SIZE];
+static size_t rtcm_buffer_len = 0;
+
 // Queue configuration
 #define RTCM_QUEUE_LENGTH   10  // Can buffer 10 RTCM messages
 #define GGA_QUEUE_LENGTH    5   // Can buffer 5 GGA sentences
@@ -43,6 +63,127 @@ static uint32_t ntrip_uptime_accumulated = 0;
 // Task configuration
 #define NTRIP_TASK_STACK_SIZE   8192
 #define NTRIP_TASK_PRIORITY     3
+
+/**
+ * @brief Extract bits from byte array (MSB first)
+ */
+static uint64_t extract_bits(const uint8_t* data, uint32_t bit_offset, uint8_t num_bits) {
+    uint64_t value = 0;
+    for (uint8_t i = 0; i < num_bits; i++) {
+        uint32_t byte_idx = (bit_offset + i) / 8;
+        uint8_t bit_idx = 7 - ((bit_offset + i) % 8);
+        if (data[byte_idx] & (1 << bit_idx)) {
+            value |= (1ULL << (num_bits - 1 - i));
+        }
+    }
+    return value;
+}
+
+/**
+ * @brief Process accumulated RTCM data and extract reference station coordinates from message 1005
+ * @param incoming_data New data from NTRIP stream
+ * @param incoming_len Length of new data
+ * @return true if RTCM 1005 was found and parsed
+ */
+static bool parse_rtcm_1005(const uint8_t* incoming_data, size_t incoming_len) {
+    bool found_1005 = false;
+    
+    // Append incoming data to buffer
+    if (rtcm_buffer_len + incoming_len > RTCM_BUFFER_SIZE) {
+        // Buffer full - shift or reset
+        if (incoming_len < RTCM_BUFFER_SIZE) {
+            // Keep most recent data
+            size_t keep_len = RTCM_BUFFER_SIZE - incoming_len;
+            memmove(rtcm_buffer, rtcm_buffer + (rtcm_buffer_len - keep_len), keep_len);
+            rtcm_buffer_len = keep_len;
+        } else {
+            // Incoming data too large, reset buffer
+            rtcm_buffer_len = 0;
+        }
+    }
+    
+    memcpy(rtcm_buffer + rtcm_buffer_len, incoming_data, incoming_len);
+    rtcm_buffer_len += incoming_len;
+    
+    // Scan buffer for RTCM frames
+    size_t i = 0;
+    while (i < rtcm_buffer_len) {
+        // Look for sync byte 0xD3
+        if (rtcm_buffer[i] != 0xD3) {
+            i++;
+            continue;
+        }
+        
+        // Need at least 3 bytes for header
+        if (i + 3 > rtcm_buffer_len) {
+            break;  // Wait for more data
+        }
+        
+        // Extract message length (10 bits, starting at bit 14)
+        uint16_t msg_len = (uint16_t)extract_bits(&rtcm_buffer[i], 14, 10);
+        
+        // Total frame length = 3 (header) + msg_len + 3 (CRC24)
+        size_t frame_len = 3 + msg_len + 3;
+        
+        // Check if we have the complete frame
+        if (i + frame_len > rtcm_buffer_len) {
+            break;  // Wait for more data
+        }
+        
+        // Extract message ID (12 bits at bit offset 24 from frame start)
+        uint16_t msg_id = (uint16_t)extract_bits(&rtcm_buffer[i], 24, 12);
+        
+        // Process message 1005 (reference station coordinates)
+        if (msg_id == 1005) {
+            // RTCM 1005: Header(24) + MsgID(12) + StationID(12) + ITRF(6) + Indicators(4) + ECEF-X(38) + ... 
+            // ECEF-X starts at bit 58 from frame start
+            uint32_t bit_pos = 58;
+            
+            // Extract ECEF X (38 bits, signed)
+            uint64_t ecef_x_raw = extract_bits(&rtcm_buffer[i], bit_pos, 38);
+            int64_t ecef_x = (ecef_x_raw & (1ULL << 37)) ? 
+                (int64_t)(ecef_x_raw | 0xFFFFFFC000000000ULL) : (int64_t)ecef_x_raw;
+            bit_pos += 38 + 2;
+            
+            // Extract ECEF Y (38 bits, signed)
+            uint64_t ecef_y_raw = extract_bits(&rtcm_buffer[i], bit_pos, 38);
+            int64_t ecef_y = (ecef_y_raw & (1ULL << 37)) ? 
+                (int64_t)(ecef_y_raw | 0xFFFFFFC000000000ULL) : (int64_t)ecef_y_raw;
+            bit_pos += 38 + 2;
+            
+            // Extract ECEF Z (38 bits, signed)
+            uint64_t ecef_z_raw = extract_bits(&rtcm_buffer[i], bit_pos, 38);
+            int64_t ecef_z = (ecef_z_raw & (1ULL << 37)) ? 
+                (int64_t)(ecef_z_raw | 0xFFFFFFC000000000ULL) : (int64_t)ecef_z_raw;
+            
+            // Convert from 0.0001 meter units to meters
+            reference_station.ecef_x = ecef_x * 0.0001;
+            reference_station.ecef_y = ecef_y * 0.0001;
+            reference_station.ecef_z = ecef_z * 0.0001;
+            reference_station.last_update_time = esp_timer_get_time();
+            reference_station.valid = true;
+            
+            ESP_LOGI(TAG, "RTCM 1005: Reference station ECEF X=%.2f, Y=%.2f, Z=%.2f m", 
+                     reference_station.ecef_x, reference_station.ecef_y, reference_station.ecef_z);
+            
+            found_1005 = true;
+        }
+        
+        // Move to next potential frame
+        i += frame_len;
+    }
+    
+    // Remove processed data from buffer
+    if (i > 0) {
+        size_t remaining = rtcm_buffer_len - i;
+        if (remaining > 0) {
+            memmove(rtcm_buffer, rtcm_buffer + i, remaining);
+        }
+        rtcm_buffer_len = remaining;
+    }
+    
+    return found_1005;
+}
 
 /**
  * @brief NTRIP Client Task main function
@@ -224,12 +365,20 @@ static void ntrip_client_task(void* pvParameters) {
             
             // Check for incoming RTCM data
             if (client->available() > 0) {
+                // Check for data gaps
+                uint64_t now = esp_timer_get_time();
+                if (last_rtcm_time != 0 && (now - last_rtcm_time) > (RTCM_GAP_THRESHOLD_MS * 1000ULL)) {
+                    ESP_LOGW(TAG, "RTCM data gap detected: %.1f sec", (now - last_rtcm_time) / 1000000.0);
+                    statistics_rtcm_data_gap();
+                }
+                
                 rtcm_data_t rtcm_msg;
                 int bytes_read = client->readData(rtcm_msg.data, sizeof(rtcm_msg.data));
                 
                 if (bytes_read < 0) {
                     // Read error - connection lost
                     ESP_LOGW(TAG, "Read error, marking connection as lost");
+                    statistics_ntrip_timeout();
                     if (ntrip_connected && ntrip_connection_start > 0) {
                         ntrip_uptime_accumulated += (time(NULL) - ntrip_connection_start);
                     }
@@ -237,6 +386,11 @@ static void ntrip_client_task(void* pvParameters) {
                     reconnect_needed = true;
                 } else if (bytes_read > 0) {
                     rtcm_msg.length = bytes_read;
+                    rtcm_msg.receive_timestamp = esp_timer_get_time();
+                    last_rtcm_time = rtcm_msg.receive_timestamp;
+                    
+                    // Parse RTCM stream for message 1005 (reference station position)
+                    parse_rtcm_1005(rtcm_msg.data, bytes_read);
                     
                     // Update statistics (assume 1 message per read for now)
                     statistics_rtcm_received(bytes_read, 1);
@@ -249,6 +403,7 @@ static void ntrip_client_task(void* pvParameters) {
                         // Queue full - remove oldest item and add new one (ring buffer)
                         rtcm_data_t dummy;
                         if (xQueueReceive(rtcm_queue, &dummy, 0) == pdTRUE) {
+                            statistics_rtcm_queue_overflow();
                             // Successfully removed old item, try adding new one again
                             if (xQueueSend(rtcm_queue, &rtcm_msg, 0) != pdTRUE) {
                                 ESP_LOGW(TAG, "Failed to add RTCM data after removing old item");
@@ -362,6 +517,16 @@ esp_err_t ntrip_client_task_init(void) {
 
 bool ntrip_client_is_connected(void) {
     return ntrip_connected;
+}
+
+bool ntrip_get_reference_station_ecef(double* ecef_x, double* ecef_y, double* ecef_z) {
+    if (!reference_station.valid || ecef_x == NULL || ecef_y == NULL || ecef_z == NULL) {
+        return false;
+    }
+    *ecef_x = reference_station.ecef_x;
+    *ecef_y = reference_station.ecef_y;
+    *ecef_z = reference_station.ecef_z;
+    return true;
 }
 
 uint32_t ntrip_get_uptime_sec(void) {

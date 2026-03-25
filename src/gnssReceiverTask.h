@@ -79,6 +79,12 @@ void gnss_receiver_task_init(void);
 void gnss_get_data(gnss_data_t *data);
 
 /**
+ * @brief Get GNSS update count and reset counter (for Hz calculation).
+ * @return Number of GGA updates since last call.
+ */
+uint32_t gnss_get_update_count_and_reset(void);
+
+/**
  * @brief Check if GNSS has valid fix.
  * @return true if valid fix, false otherwise.
  */

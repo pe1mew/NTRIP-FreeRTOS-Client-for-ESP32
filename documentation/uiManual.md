@@ -320,13 +320,14 @@ MQTT (Message Queuing Telemetry Transport) is a lightweight messaging protocol i
 
 #### Published Topics
 
-The device publishes three types of messages to MQTT:
+The device publishes four types of messages to MQTT:
 
 | Topic | Content | Default Interval | Purpose |
 |-------|---------|------------------|---------|
 | `<base>/GNSS` | GPS position data | 10 seconds | Real-time location tracking |
 | `<base>/status` | System health status | 120 seconds | Overall system health |
 | `<base>/stats` | Performance statistics | 60 seconds | Detailed metrics |
+| `<base>/live` | External telemetry data | Real-time | Forward telemetry from UART1 (optional) |
 
 Where `<base>` is your configured base topic (e.g., `ntripclient`).
 
@@ -342,6 +343,7 @@ Where `<base>` is your configured base topic (e.g., `ntripclient`).
 | **GNSS Interval (sec)** | Position publish interval | `10` | Number | 0-300 | No |
 | **Status Interval (sec)** | Status publish interval | `120` | Number | 0-600 | No |
 | **Stats Interval (sec)** | Statistics publish interval | `60` | Number | 0-600 | No |
+| **Telemetry Forward** | Forward external telemetry from UART1 | `false` | Checkbox | - | - |
 | **Enabled** | Enable/disable MQTT client | `false` | Checkbox | - | - |
 
 \* Required if your broker requires authentication
@@ -388,6 +390,12 @@ Where `<base>` is your configured base topic (e.g., `ntripclient`).
      - `60` seconds (1 minute) = default
      - Includes RTK fix quality, HDOP, satellite counts, error rates
      - `0` = disable statistics publishing
+
+   - **Telemetry Forward**: Forward external telemetry data
+     - Check to enable forwarding telemetry JSON from UART1 RX
+     - Publishes to `<base>/live` topic in real-time
+     - Used for forwarding data from external telemetry devices
+     - Leave unchecked if not using external telemetry input
 
 4. **Enable the service**
    - Check the "Enabled" checkbox
@@ -464,34 +472,90 @@ All messages are published in **JSON format** for easy parsing.
 **Example Statistics Message** (`ntripclient/stats`):
 ```json
 {
-   "timestamp": "2025-03-28 10:27:06.200",
+   "timestamp": "2026-03-25 16:09:59.900",
    "period_sec": 60,
    "rtcm": {
-      "bytes_received": 9856,
+      "bytes_received": 38400,
       "message_rate": 3,
-      "data_gaps": 0
+      "data_gaps": 0,
+      "avg_latency_ms": 0,
+      "corrupted": 75
    },
    "gnss": {
       "fix_duration": {
          "no_fix": 0,
          "gps": 0,
          "dgps": 0,
-         "rtk_float": 8,
-         "rtk_fixed": 52
+         "rtk_float": 0,
+         "rtk_fixed": 20
       },
-      "rtk_fixed_percent": 86.7,
-      "hdop_avg": 0.52,
-      "sats_avg": 29
+      "rtk_fixed_percent": 33.3,
+      "time_to_rtk_fixed_sec": 45,
+      "fix_downgrades": 0,
+      "fix_upgrades": 1,
+      "hdop_avg": 0.56,
+      "hdop_min": 0.54,
+      "hdop_max": 0.59,
+      "sats_avg": 27,
+      "baseline_distance_km": 12.5,
+      "update_rate_hz": 10
+   },
+   "gga": {
+      "sent_count": 1,
+      "failures": 0,
+      "queue_overflows": 0
    },
    "wifi": {
-      "rssi_avg": -67,
+      "rssi_avg": -65,
+      "rssi_min": -72,
+      "rssi_max": -58,
       "uptime_percent": 100.0
    },
    "errors": {
       "nmea_checksum": 0,
       "uart": 0,
-      "rtcm_queue_overflow": 0
+      "rtcm_queue_overflow": 0,
+      "ntrip_timeouts": 0
    }
+}
+```
+
+**Field Descriptions**:
+- `timestamp`: ISO 8601 timestamp when statistics were collected
+- `period_sec`: Statistics collection period in seconds (typically 60)
+- **RTCM Section**:
+  - `bytes_received`: Total RTCM correction data bytes received during period
+  - `message_rate`: Average RTCM messages received per second
+  - `data_gaps`: Number of RTCM data gaps detected (>5 seconds between messages)
+  - `avg_latency_ms`: Average latency from receiving RTCM to forwarding to GNSS (0 if no data)
+  - `corrupted`: Number of RTCM messages with invalid framing/sync bytes detected
+- **GNSS Section**:
+  - `fix_duration`: Seconds spent in each fix quality state during the period
+  - `rtk_fixed_percent`: Percentage of time with RTK Fixed solution
+  - `time_to_rtk_fixed_sec`: Time taken to achieve first RTK Fixed after boot (seconds)
+  - `fix_downgrades`: Number of times fix quality degraded (e.g., Fixed→Float→DGPS)
+  - `fix_upgrades`: Number of times fix quality improved
+  - `hdop_avg/min/max`: Horizontal Dilution of Precision statistics (lower is better)
+  - `sats_avg`: Average number of satellites used during the period
+  - `baseline_distance_km`: Distance to NTRIP reference station (from RTCM 1005/1006 messages)
+  - `update_rate_hz`: GNSS position update frequency (GGA messages per second)
+- **GGA Section**:
+  - `sent_count`: Number of GGA messages sent to NTRIP caster during period
+  - `failures`: Number of failed GGA transmissions
+  - `queue_overflows`: Times the GGA queue was full (messages dropped)
+- **WiFi Section**:
+  - `rssi_avg/min/max`: WiFi signal strength statistics in dBm (-30=excellent, -90=poor)
+  - `uptime_percent`: Percentage of time WiFi was connected during the period
+- **Errors Section**:
+  - `nmea_checksum`: NMEA checksum validation failures
+  - `uart`: UART communication errors (GNSS or telemetry)
+  - `rtcm_queue_overflow`: RTCM receive queue overflow count (data loss)
+  - `ntrip_timeouts`: NTRIP connection timeout/read error count
+
+**Example Live Telemetry Message** (`ntripclient/live`, real-time, optional):
+```json
+{
+    ... raw JSON from external telemetry device ...
 }
 ```
 
@@ -515,8 +579,9 @@ All messages are published in **JSON format** for easy parsing.
 - **Bandwidth estimation**:
   - GNSS message: ~200 bytes
   - Status message: ~250 bytes
-  - Stats message: ~300 bytes
-  - Example (default intervals): ~3 KB/minute
+  - Stats message: ~500 bytes (expanded with new metrics)
+  - Live telemetry: Variable (depends on external device)
+  - Example (default intervals, no live): ~4 KB/minute
 
 - **Security considerations**:
   - Always use authentication on production brokers
@@ -611,19 +676,29 @@ The web interface displays real-time system status at the top of the page. This 
 
 The status section automatically refreshes every **5 seconds** while you have the configuration page open. You do not need to manually refresh the browser.
 
+### Connection Loss Detection
+
+If the device becomes unreachable (powered off, network issue, restarting), the web interface will:
+- Detect connection loss after a failed status update
+- Display a modal popup indicating the device is unreachable
+- Continue attempting to reconnect automatically
+- Resume normal operation when connection is restored
+
+This helps you identify when the device has restarted or lost power.
+
 ---
 
 ## Service Control
 
 ### Runtime Enable/Disable Toggle
 
-You can enable or disable NTRIP and MQTT services without changing their configuration or restarting the device.
+You can enable or disable NTRIP and MQTT services instantly without restarting the device.
 
 **How to use**:
 1. Locate the "Enabled" checkbox in the NTRIP or MQTT configuration section
-2. Check the box to enable, uncheck to disable
-3. Click the corresponding "Save" button
-4. The service will start or stop immediately
+2. Check or uncheck the box - **the service starts or stops immediately**
+3. **For temporary changes**: Leave it as is (reverts to saved state on reboot)
+4. **For permanent changes**: Click the "Save" button to persist the new state
 
 **Use cases**:
 - Temporarily disable NTRIP to save bandwidth
@@ -631,11 +706,16 @@ You can enable or disable NTRIP and MQTT services without changing their configu
 - Test configuration changes without full restart
 - Quickly turn services on/off for troubleshooting
 
+**How it works**:
+- **Checkbox change**: Immediate runtime effect (service starts/stops instantly)
+- **Without Save**: Change is temporary and reverts to saved configuration on reboot
+- **With Save**: Change is persisted to flash memory and survives reboots
+
 **What happens when disabled**:
 - Service stops cleanly (closes connections)
 - No data is transmitted or received
-- Configuration is preserved
-- Re-enabling reconnects with saved settings
+- Other configuration settings are preserved
+- Re-enabling reconnects with existing settings
 
 ---
 
@@ -706,13 +786,15 @@ Erases **all configuration** and restores device to factory default settings.
 
 ## Password Recovery
 
-If you forget the UI password, you can reset it without losing other configuration.
+If you forget the UI password, you can reset it using the hardware BOOT button without losing other configuration.
 
-### Hardware Button Reset Method
+### Hardware Button Reset Methods
 
 **Requirements**:
 - Physical access to the device
 - Access to the BOOT button (GPIO 0)
+
+#### Method 1: UI Password Reset Only (5-10 seconds)
 
 **Procedure**:
 1. **Locate the BOOT button** on the ESP32 board
@@ -720,14 +802,18 @@ If you forget the UI password, you can reset it without losing other configurati
    - Often located near the USB connector
 
 2. **Press and hold the BOOT button**
-   - Hold for **5 seconds continuously**
-   - Do not release early
+   - Hold for **5-10 seconds continuously**
+   - Do not release before 5 seconds
+   - Do not hold past 10 seconds (triggers factory reset)
 
 3. **Observe the RGB LED**
-   - The LED may change color or pattern to indicate reset
+   - The RGB LED will turn **BLUE** after 5 seconds
+   - This indicates password reset is in progress
 
 4. **Release the button**
+   - Release after seeing blue LED (before 10 seconds)
    - The UI password is now reset to `admin`
+   - RGB LED will turn off when you release
 
 5. **Reconnect to web interface**
    - Navigate to http://192.168.4.1
@@ -740,12 +826,44 @@ If you forget the UI password, you can reset it without losing other configurati
 - This does NOT perform a full factory reset
 - The device does not need to restart
 
+#### Method 2: Full Factory Reset (10+ seconds)
+
+**⚠️ WARNING**: This will erase ALL configuration settings.
+
+**Procedure**:
+1. Press and hold the BOOT button for **more than 10 seconds**
+2. RGB LED will turn **BLUE** at 5 seconds (password reset starts)
+3. RGB LED will turn **GREEN** at 10 seconds (factory reset initiated)
+4. Release the button after seeing green LED
+5. Device will perform factory reset and restart automatically
+6. All settings return to factory defaults
+7. Reconnect to WiFi AP: `NTRIPClient-XXXX` (password: `config123`)
+8. Login with default UI password: `admin`
+
+**What is reset**:
+- UI password → `admin`
+- All WiFi settings → Defaults
+- All NTRIP settings → Defaults
+- All MQTT settings → Defaults
+- All services → Disabled
+
+### Button Reset Visual Feedback
+
+| Duration | RGB LED Color | Action |
+|----------|---------------|--------|
+| 0-5 sec | OFF | Waiting |
+| 5-10 sec | BLUE | UI password reset queued |
+| 10+ sec | GREEN | Factory reset initiated, will restart |
+| Released | OFF | Action completed |
+
 ### What if button reset doesn't work?
 
 If the hardware button method fails:
-1. Perform a full Factory Reset via web interface (if accessible)
-2. Re-flash the firmware using USB connection
-3. Contact support for assistance
+1. Verify you're holding the correct button (GPIO 0 / BOOT)
+2. Ensure device is powered on
+3. Check RGB LED is functioning (may be disabled in code)
+4. Perform a full Factory Reset via web interface (if accessible)
+5. Re-flash the firmware using USB connection
 
 ---
 
@@ -996,6 +1114,7 @@ When the device is first powered on or after factory reset, the following defaul
 | GNSS Interval | `10` seconds | Position published every 10 seconds |
 | Status Interval | `120` seconds | Status published every 2 minutes |
 | Stats Interval | `60` seconds | Statistics published every minute |
+| Telemetry Forward | `false` | Disabled unless using external telemetry |
 | Enabled | `false` | Disabled until configured |
 
 ### Hardware Configuration (Fixed)

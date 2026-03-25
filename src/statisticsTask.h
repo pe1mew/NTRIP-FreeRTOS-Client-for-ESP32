@@ -243,6 +243,48 @@ void statistics_gga_sent(bool success);
 void statistics_telemetry_received(bool crc_ok);
 
 /**
+ * @brief Update NMEA checksum error counter
+ */
+void statistics_nmea_checksum_error(void);
+
+/**
+ * @brief Update UART error counter
+ */
+void statistics_uart_error(void);
+
+/**
+ * @brief Update RTCM queue overflow counter
+ */
+void statistics_rtcm_queue_overflow(void);
+
+/**
+ * @brief Update GGA queue overflow counter
+ */
+void statistics_gga_queue_overflow(void);
+
+/**
+ * @brief Update NTRIP timeout counter
+ */
+void statistics_ntrip_timeout(void);
+
+/**
+ * @brief Update RTCM latency measurement
+ * 
+ * @param latency_ms Latency in milliseconds
+ */
+void statistics_rtcm_latency(uint32_t latency_ms);
+
+/**
+ * @brief Update RTCM data gap counter
+ */
+void statistics_rtcm_data_gap(void);
+
+/**
+ * @brief Update RTCM corrupted message counter
+ */
+void statistics_rtcm_corrupted(void);
+
+/**
  * @brief Format statistics as JSON string
  * 
  * @param buffer Output buffer for JSON string

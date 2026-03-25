@@ -29,8 +29,9 @@ extern QueueHandle_t gga_queue;   ///< Queue for GGA sentences (GNSS → NTRIP)
  * @brief RTCM data structure for queue
  */
 typedef struct {
-    uint8_t data[512];  ///< RTCM data buffer (typical RTCM message < 500 bytes)
-    size_t length;      ///< Actual data length
+    uint8_t data[512];       ///< RTCM data buffer (typical RTCM message < 500 bytes)
+    size_t length;           ///< Actual data length
+    uint64_t receive_timestamp; ///< Timestamp when data was received (microseconds from esp_timer_get_time())
 } rtcm_data_t;
 
 /**
@@ -57,6 +58,15 @@ esp_err_t ntrip_client_task_init(void);
  * @return true if connected to NTRIP caster, false otherwise
  */
 bool ntrip_client_is_connected(void);
+
+/**
+ * @brief Get reference station ECEF coordinates
+ * @param ecef_x Pointer to receive X coordinate (meters)
+ * @param ecef_y Pointer to receive Y coordinate (meters)
+ * @param ecef_z Pointer to receive Z coordinate (meters)
+ * @return true if valid reference station data available, false otherwise
+ */
+bool ntrip_get_reference_station_ecef(double* ecef_x, double* ecef_y, double* ecef_z);
 
 /**
  * @brief Get NTRIP client connection status - Compatibility wrapper

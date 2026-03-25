@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/time.h>
 #include <stdio.h>
+#include <math.h>
 
 static const char *TAG = "StatsTask";
 
@@ -52,6 +53,10 @@ static uint32_t sat_sum = 0;
 static int32_t rssi_sample_count = 0;
 static int32_t rssi_sum = 0;
 
+// RTCM latency tracking
+static uint64_t rtcm_latency_sum_ms = 0;
+static uint32_t rtcm_latency_count = 0;
+
 /**
  * @brief Initialize statistics structures to zero
  */
@@ -65,12 +70,12 @@ static void init_statistics(void) {
     // Initialize min values to max possible
     stats.runtime.hdop_min_boot = 99.9f;
     stats.runtime.satellites_min_boot = 255;
-    stats.runtime.wifi_rssi_min_boot = 0;
+    stats.runtime.wifi_rssi_min_boot = INT8_MAX;
     stats.runtime.heap_min_free_bytes = 0xFFFFFFFF;
     
     stats.period.hdop_min = 99.9f;
     stats.period.satellites_min = 255;
-    stats.period.wifi_rssi_min = 0;
+    stats.period.wifi_rssi_min = INT8_MAX;
 }
 
 /**
@@ -98,6 +103,11 @@ static void reset_period_stats(void) {
         sat_sample_count = 0;
         sat_sum = 0;
         rssi_sample_count = 0;
+        rssi_sum = 0;
+        
+        // Reset latency tracking
+        rtcm_latency_sum_ms = 0;
+        rtcm_latency_count = 0;
         rssi_sum = 0;
         
         xSemaphoreGive(stats_mutex);
@@ -171,6 +181,35 @@ static void collect_stack_hwm(void) {
 }
 
 /**
+ * @brief Convert WGS84 latitude/longitude/altitude to ECEF coordinates
+ * @param lat Latitude in decimal degrees
+ * @param lon Longitude in decimal degrees
+ * @param alt Altitude in meters (above WGS84 ellipsoid)
+ * @param x Output ECEF X coordinate (meters)
+ * @param y Output ECEF Y coordinate (meters)
+ * @param z Output ECEF Z coordinate (meters)
+ */
+static void lat_lon_alt_to_ecef(double lat, double lon, float alt, double* x, double* y, double* z) {
+    // WGS84 constants
+    const double a = 6378137.0;              // Semi-major axis (m)
+    const double e2 = 0.00669437999014;      // First eccentricity squared
+    
+    // Convert degrees to radians
+    double lat_rad = lat * M_PI / 180.0;
+    double lon_rad = lon * M_PI / 180.0;
+    
+    // Calculate prime vertical radius of curvature (N)
+    double sin_lat = sin(lat_rad);
+    double cos_lat = cos(lat_rad);
+    double N = a / sqrt(1.0 - e2 * sin_lat * sin_lat);
+    
+    // Calculate ECEF coordinates
+    *x = (N + alt) * cos_lat * cos(lon_rad);
+    *y = (N + alt) * cos_lat * sin(lon_rad);
+    *z = (N * (1.0 - e2) + alt) * sin_lat;
+}
+
+/**
  * @brief Collect WiFi statistics
  */
 static void collect_wifi_stats(void) {
@@ -188,7 +227,7 @@ static void collect_wifi_stats(void) {
             
             // Update period
             stats.period.wifi_rssi_dbm = rssi;
-            if (rssi < stats.period.wifi_rssi_min || stats.period.wifi_rssi_min == 0) {
+            if (rssi < stats.period.wifi_rssi_min) {
                 stats.period.wifi_rssi_min = rssi;
             }
             if (rssi > stats.period.wifi_rssi_max) {
@@ -199,7 +238,7 @@ static void collect_wifi_stats(void) {
             stats.period.wifi_rssi_avg = rssi_sample_count > 0 ? (rssi_sum / rssi_sample_count) : 0;
             
             // Update runtime
-            if (rssi < stats.runtime.wifi_rssi_min_boot || stats.runtime.wifi_rssi_min_boot == 0) {
+            if (rssi < stats.runtime.wifi_rssi_min_boot) {
                 stats.runtime.wifi_rssi_min_boot = rssi;
             }
             if (rssi > stats.runtime.wifi_rssi_max_boot) {
@@ -222,6 +261,9 @@ static void collect_wifi_stats(void) {
 static void collect_gnss_stats(void) {
     gnss_data_t gnss_data;
     gnss_get_data(&gnss_data);
+    
+    // Get GNSS update rate (Hz)
+    stats.period.gnss_update_rate_hz = gnss_get_update_count_and_reset();
     
     if (gnss_data.valid) {
         // Track fix quality changes
@@ -334,6 +376,42 @@ static void collect_gnss_stats(void) {
             }
         }
     }
+    
+    // Calculate baseline distance if we have both rover and reference station positions
+    if (gnss_data.valid && gnss_data.fix_quality >= 1) {
+        double ref_x, ref_y, ref_z;
+        if (ntrip_get_reference_station_ecef(&ref_x, &ref_y, &ref_z)) {
+            // Convert rover position from lat/lon/alt to ECEF
+            double rover_x, rover_y, rover_z;
+            lat_lon_alt_to_ecef(gnss_data.latitude, gnss_data.longitude, gnss_data.altitude, 
+                               &rover_x, &rover_y, &rover_z);
+            
+            // Calculate Euclidean distance
+            double dx = rover_x - ref_x;
+            double dy = rover_y - ref_y;
+            double dz = rover_z - ref_z;
+            double distance_m = sqrt(dx * dx + dy * dy + dz * dz);
+            
+            // Convert to kilometers
+            stats.period.baseline_distance_km = (float)(distance_m / 1000.0);
+            
+            // Sanity check: baseline distance should typically be < 200 km for RTK
+            if (stats.period.baseline_distance_km > 200.0) {
+                ESP_LOGW(TAG, "WARNING: Baseline distance %.2f km exceeds typical RTK range (< 200 km)", 
+                         stats.period.baseline_distance_km);
+                // Check if coordinates look reasonable (should be ~6.4 million meters from Earth center)
+                double rover_radius = sqrt(rover_x * rover_x + rover_y * rover_y + rover_z * rover_z);
+                double ref_radius = sqrt(ref_x * ref_x + ref_y * ref_y + ref_z * ref_z);
+                
+                if (rover_radius < 100000.0 || rover_radius > 10000000.0) {
+                    ESP_LOGE(TAG, "ERROR: Rover ECEF invalid (radius %.0f m). Check NMEA parsing.", rover_radius);
+                }
+                if (ref_radius < 100000.0 || ref_radius > 10000000.0) {
+                    ESP_LOGE(TAG, "ERROR: Reference ECEF invalid (radius %.0f m). Check RTCM 1005 parsing.", ref_radius);
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -390,6 +468,11 @@ static void statistics_task(void *pvParameters) {
                     uint32_t period_sec = (stats.period_duration_sec > 0) ? stats.period_duration_sec : log_counter;
                     stats.period.rtcm_bytes_per_sec = stats.period.rtcm_bytes_received / period_sec;
                     stats.period.rtcm_message_rate = stats.period.rtcm_messages_received / period_sec;
+                }
+                
+                // Calculate average RTCM latency
+                if (rtcm_latency_count > 0) {
+                    stats.period.rtcm_avg_latency_ms = (uint32_t)(rtcm_latency_sum_ms / rtcm_latency_count);
                 }
                 
                 // Log summary
@@ -550,6 +633,94 @@ void statistics_telemetry_received(bool crc_ok) {
         } else {
             stats.runtime.telemetry_json_crc_fail++;
         }
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
+ * @brief Update NMEA checksum error counter
+ */
+void statistics_nmea_checksum_error(void) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stats.runtime.nmea_checksum_errors_total++;
+        stats.period.nmea_checksum_errors++;
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
+ * @brief Update UART error counter
+ */
+void statistics_uart_error(void) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stats.runtime.uart_errors_total++;
+        stats.period.uart_errors++;
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
+ * @brief Update RTCM queue overflow counter
+ */
+void statistics_rtcm_queue_overflow(void) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stats.runtime.rtcm_queue_overflows_total++;
+        stats.period.rtcm_queue_overflows++;
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
+ * @brief Update GGA queue overflow counter
+ */
+void statistics_gga_queue_overflow(void) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stats.runtime.gga_queue_overflows_total++;
+        stats.period.gga_queue_overflows++;
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
+ * @brief Update NTRIP timeout counter
+ */
+void statistics_ntrip_timeout(void) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stats.runtime.ntrip_timeouts_total++;
+        stats.period.ntrip_timeouts++;
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
+ * @brief Update RTCM latency measurement
+ */
+void statistics_rtcm_latency(uint32_t latency_ms) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        rtcm_latency_sum_ms += latency_ms;
+        rtcm_latency_count++;
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
+ * @brief Update RTCM data gap counter
+ */
+void statistics_rtcm_data_gap(void) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stats.runtime.rtcm_data_gaps_total++;
+        stats.period.rtcm_data_gaps++;
+        xSemaphoreGive(stats_mutex);
+    }
+}
+
+/**
+ * @brief Update RTCM corrupted message counter
+ */
+void statistics_rtcm_corrupted(void) {
+    if (xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        stats.runtime.rtcm_corrupted_count_total++;
+        stats.period.rtcm_corrupted_count++;
         xSemaphoreGive(stats_mutex);
     }
 }

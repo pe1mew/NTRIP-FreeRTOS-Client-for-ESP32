@@ -3,6 +3,7 @@
 #include "configurationManagerTask.h"
 #include "hardware_config.h"
 #include "NMEAparser/NMEAParser.h"
+#include "statisticsTask.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -33,6 +34,9 @@ static gnss_data_t gnss_data;
 static SemaphoreHandle_t gnss_data_mutex = NULL;
 static TaskHandle_t gnss_task_handle = NULL;
 EventGroupHandle_t gnss_event_group = NULL;
+
+// GNSS update rate tracking
+static uint32_t gga_update_count = 0;
 
 // Calculate NMEA checksum
 static uint8_t calculate_nmea_checksum(const char *sentence) {
@@ -93,6 +97,7 @@ static bool is_sentence_type(const char *sentence, const char *type) {
 static void update_gnss_data(const char *sentence) {
     if (!validate_nmea_sentence(sentence)) {
         ESP_LOGD(TAG, "Invalid NMEA checksum");
+        statistics_nmea_checksum_error();
         return;
     }
     
@@ -106,6 +111,9 @@ static void update_gnss_data(const char *sentence) {
             // Store raw GGA for NTRIP
             strncpy(gnss_data.gga, sentence, sizeof(gnss_data.gga) - 1);
             gnss_data.gga[sizeof(gnss_data.gga) - 1] = '\0';
+            
+            // Count GGA updates for rate tracking
+            gga_update_count++;
             
             // Parse GGA using NMEAParser
             GGAData gga = parseGGASentence(sentence);
@@ -249,10 +257,16 @@ static void gnss_receiver_task(void *pvParameters) {
         // Check for RTCM data from NTRIP Client
         rtcm_data_t rtcm_data;
         if (xQueueReceive(rtcm_queue, &rtcm_data, 0) == pdTRUE) {
+            // Calculate latency (time from receive to now)
+            uint64_t now = esp_timer_get_time();
+            uint32_t latency_ms = (uint32_t)((now - rtcm_data.receive_timestamp) / 1000);
+            statistics_rtcm_latency(latency_ms);
+            
             // Forward RTCM data to GPS receiver
             int written = uart_write_bytes(GNSS_UART_NUM, rtcm_data.data, rtcm_data.length);
             if (written < 0) {
                 ESP_LOGW(TAG, "Failed to write RTCM data to GPS");
+                statistics_uart_error();
             } else {
                 ESP_LOGD(TAG, "Forwarded %d bytes RTCM to GPS", written);
             }
@@ -262,7 +276,10 @@ static void gnss_receiver_task(void *pvParameters) {
         uint8_t data[128];
         int len = uart_read_bytes(GNSS_UART_NUM, data, sizeof(data) - 1, pdMS_TO_TICKS(GNSS_UART_TIMEOUT_MS));
         
-        if (len > 0) {
+        if (len < 0) {
+            // UART read error
+            statistics_uart_error();
+        } else if (len > 0) {
             // Process received data byte by byte
             for (int i = 0; i < len; i++) {
                 char c = data[i];
@@ -308,6 +325,7 @@ static void gnss_receiver_task(void *pvParameters) {
                         last_gga_time = current_time;
                     } else {
                         ESP_LOGW(TAG, "GGA queue full, overwriting");
+                        statistics_gga_queue_overflow();
                         // For GGA queue, we want the latest data, so overwrite
                         xQueueReset(gga_queue);
                         xQueueSend(gga_queue, &gga_data, 0);
@@ -391,6 +409,12 @@ void gnss_get_data(gnss_data_t *data) {
         memcpy(data, &gnss_data, sizeof(gnss_data_t));
         xSemaphoreGive(gnss_data_mutex);
     }
+}
+
+uint32_t gnss_get_update_count_and_reset(void) {
+    uint32_t count = gga_update_count;
+    gga_update_count = 0;
+    return count;
 }
 
 bool gnss_has_valid_fix(void) {
