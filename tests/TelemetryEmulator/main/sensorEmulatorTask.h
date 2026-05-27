@@ -16,12 +16,21 @@
  * SOH/DLE-stuffed/CRC-16/CAN frame, and transmitted over UART1 TX
  * (GPIO4, 115200 8N1).
  *
- * JSON schema (see documentation/json.md for the full field reference):
+ * JSON schema (see documentation/json.md for the full field reference,
+ * mirrors the CSV payload tags defined in documentation/framedCRCString.md):
  *
  *   {"seq":N,"tim":"HH:MM:SS.mmm",
- *    "vhl":{"thr":{min,max,avg},"spd":{min,max,avg},"lat":F,"lon":F},
- *    "mtr":{"pwr":{min,max,avg},"rpm":{min,max,avg},"trq":{min,max,avg}},
- *    "spc":{"vsc":{min,max,avg},"fsa":{min,max,avg},"tankP":F}}
+ *    "vhl":{
+ *       "acc":{"x":{min,max,avg},"y":{min,max,avg},"z":{min,max,avg}},
+ *       "thr":{"val":{min,max,avg},
+ *              "ctrlMode":I,"mtrMode":I,"swEn":I,"dbgMode":I},
+ *       "spd":{min,max,avg},"lat":F,"lon":F},
+ *    "mtr":{
+ *       "mtl":{"ctrl":{min,max,avg},
+ *              "ctrlMode":I,"mtrMode":I,"swEn":I,"state":I,
+ *              "trq":{min,max,avg},"rpm":{min,max,avg},"tmp":{min,max,avg}},
+ *       "mpw":{"pwr":{min,max,avg},"cur":{min,max,avg}}},
+ *    "spc":{"fan":I,"h2P1":F,"h2P2":F,"tankP":F,"vsc":F,"fsa":F}}
  *
  * @return ESP_OK on success, error code otherwise.
  */

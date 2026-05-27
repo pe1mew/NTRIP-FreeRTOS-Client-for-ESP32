@@ -2,6 +2,7 @@
 #include "configurationManagerTask.h"
 #include "ntripClientTask.h"
 #include "mqttClientTask.h"
+#include "statisticsTask.h"
 #include "wifiManager.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -13,6 +14,9 @@ static const char* TAG = "HTTPServer";
 
 static httpd_handle_t server = NULL;
 #include "gnssReceiverTask.h"
+
+extern "C" uint32_t data_output_get_rx_bytes_total(void);
+extern "C" uint32_t data_output_get_rx_frame_overflows(void);
 
 // Simple session token (static for now)
 static const char* SESSION_TOKEN = "esp_session_token_123";
@@ -839,6 +843,107 @@ static esp_err_t api_status_get_handler(httpd_req_t *req) {
 }
 
 /**
+ * @brief Handler for GET /api/stats — full system_statistics snapshot.
+ *
+ * Pulls the thread-safe copy from statistics_get() and serializes runtime +
+ * period subsets to JSON for field diagnostics. The information mirrors what
+ * the serial summary prints, plus the network-quality classification.
+ */
+static esp_err_t api_stats_get_handler(httpd_req_t *req) {
+    if (!check_auth(req)) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"Unauthorized\"}");
+        return ESP_FAIL;
+    }
+
+    system_statistics_t s;
+    statistics_get(&s);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "period_duration_sec", s.period_duration_sec);
+    cJSON_AddNumberToObject(root, "network_quality", (int)network_quality_classify());
+
+    // ---- Runtime (cumulative since boot) -----------------------------------
+    cJSON *rt = cJSON_CreateObject();
+    cJSON_AddNumberToObject(rt, "system_uptime_sec", s.runtime.system_uptime_sec);
+    cJSON_AddNumberToObject(rt, "heap_min_free_bytes", s.runtime.heap_min_free_bytes);
+    // NTRIP
+    cJSON_AddNumberToObject(rt, "ntrip_uptime_sec", s.runtime.ntrip_uptime_sec);
+    cJSON_AddNumberToObject(rt, "ntrip_reconnect_count", s.runtime.ntrip_reconnect_count);
+    cJSON_AddNumberToObject(rt, "ntrip_avg_reconnect_time_ms", s.runtime.ntrip_avg_reconnect_time_ms);
+    cJSON_AddNumberToObject(rt, "ntrip_timeouts_total", s.runtime.ntrip_timeouts_total);
+    // RTCM
+    cJSON_AddNumberToObject(rt, "rtcm_bytes_received_total", (double)s.runtime.rtcm_bytes_received_total);
+    cJSON_AddNumberToObject(rt, "rtcm_messages_received_total", s.runtime.rtcm_messages_received_total);
+    cJSON_AddNumberToObject(rt, "rtcm_data_gaps_total", s.runtime.rtcm_data_gaps_total);
+    cJSON_AddNumberToObject(rt, "rtcm_queue_overflows_total", s.runtime.rtcm_queue_overflows_total);
+    cJSON_AddNumberToObject(rt, "rtcm_queue_peak_count", s.runtime.rtcm_queue_peak_count);
+    cJSON_AddNumberToObject(rt, "gga_queue_peak_count", s.runtime.gga_queue_peak_count);
+    // GGA / errors
+    cJSON_AddNumberToObject(rt, "gga_sent_count_total", s.runtime.gga_sent_count_total);
+    cJSON_AddNumberToObject(rt, "gga_send_failures_total", s.runtime.gga_send_failures_total);
+    cJSON_AddNumberToObject(rt, "nmea_checksum_errors_total", s.runtime.nmea_checksum_errors_total);
+    cJSON_AddNumberToObject(rt, "uart_errors_total", s.runtime.uart_errors_total);
+    cJSON_AddNumberToObject(rt, "wifi_reconnect_count_total", s.runtime.wifi_reconnect_count_total);
+    cJSON_AddNumberToObject(rt, "wifi_uptime_sec", s.runtime.wifi_uptime_sec);
+    // Telemetry JSON forwarding (UART1 RX → MQTT /live)
+    cJSON_AddNumberToObject(rt, "telemetry_json_received", s.runtime.telemetry_json_received);
+    cJSON_AddNumberToObject(rt, "telemetry_json_crc_fail", s.runtime.telemetry_json_crc_fail);
+    cJSON_AddNumberToObject(rt, "telemetry_rx_bytes_total", data_output_get_rx_bytes_total());
+    cJSON_AddNumberToObject(rt, "telemetry_rx_frame_overflows", data_output_get_rx_frame_overflows());
+    // Stack high-water marks (lower = closer to overflow)
+    cJSON *stack = cJSON_CreateObject();
+    cJSON_AddNumberToObject(stack, "ntrip",   s.runtime.stack_hwm_ntrip);
+    cJSON_AddNumberToObject(stack, "gnss",    s.runtime.stack_hwm_gnss);
+    cJSON_AddNumberToObject(stack, "dataout", s.runtime.stack_hwm_dataout);
+    cJSON_AddNumberToObject(stack, "stats",   s.runtime.stack_hwm_stats);
+    cJSON_AddNumberToObject(stack, "led",     s.runtime.stack_hwm_led);
+    cJSON_AddItemToObject(rt, "stack_hwm", stack);
+    cJSON_AddItemToObject(root, "runtime", rt);
+
+    // ---- Period (current logging window) -----------------------------------
+    cJSON *pe = cJSON_CreateObject();
+    cJSON_AddNumberToObject(pe, "rtcm_bytes_received", s.period.rtcm_bytes_received);
+    cJSON_AddNumberToObject(pe, "rtcm_message_rate", s.period.rtcm_message_rate);
+    cJSON_AddNumberToObject(pe, "rtcm_data_gaps", s.period.rtcm_data_gaps);
+    cJSON_AddNumberToObject(pe, "rtcm_gap_duration_sec", s.period.rtcm_gap_duration_sec);
+    cJSON_AddNumberToObject(pe, "rtcm_queue_overflows", s.period.rtcm_queue_overflows);
+    cJSON_AddNumberToObject(pe, "rtcm_queue_avg_count", s.period.rtcm_queue_avg_count);
+    cJSON_AddNumberToObject(pe, "gga_queue_avg_count", s.period.gga_queue_avg_count);
+    cJSON_AddNumberToObject(pe, "ntrip_timeouts", s.period.ntrip_timeouts);
+    cJSON_AddNumberToObject(pe, "wifi_rssi_avg", s.period.wifi_rssi_avg);
+    cJSON_AddNumberToObject(pe, "wifi_rssi_min", s.period.wifi_rssi_min);
+    cJSON_AddNumberToObject(pe, "wifi_rssi_max", s.period.wifi_rssi_max);
+    cJSON_AddNumberToObject(pe, "wifi_reconnect_count", s.period.wifi_reconnect_count);
+    cJSON_AddNumberToObject(pe, "wifi_uptime_percent", s.period.wifi_uptime_percent);
+    cJSON_AddNumberToObject(pe, "heap_free_bytes", s.period.heap_free_bytes);
+    cJSON_AddNumberToObject(pe, "heap_largest_block", s.period.heap_largest_block);
+    cJSON_AddNumberToObject(pe, "gnss_update_rate_hz", s.period.gnss_update_rate_hz);
+    cJSON_AddNumberToObject(pe, "baseline_distance_km", s.period.baseline_distance_km);
+    cJSON_AddNumberToObject(pe, "nmea_checksum_errors", s.period.nmea_checksum_errors);
+    cJSON_AddNumberToObject(pe, "uart_errors", s.period.uart_errors);
+    // Per-task CPU% and loop-time arrays — indices: 0=NTRIP 1=GNSS 2=DataOut 3=LED 4=Stats
+    cJSON *cpu = cJSON_CreateArray();
+    cJSON *loop_ms = cJSON_CreateArray();
+    for (int i = 0; i < 5; i++) {
+        cJSON_AddItemToArray(cpu,     cJSON_CreateNumber(s.period.cpu_usage_percent[i]));
+        cJSON_AddItemToArray(loop_ms, cJSON_CreateNumber(s.period.avg_task_loop_time_ms[i]));
+    }
+    cJSON_AddItemToObject(pe, "cpu_usage_percent", cpu);
+    cJSON_AddItemToObject(pe, "avg_task_loop_time_ms", loop_ms);
+    cJSON_AddItemToObject(root, "period", pe);
+
+    char *json_string = cJSON_Print(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json_string);
+
+    free(json_string);
+    cJSON_Delete(root);
+
+    return ESP_OK;
+}
+
+/**
  * @brief Handler for POST /api/toggle
  */
 static esp_err_t api_toggle_post_handler(httpd_req_t *req) {
@@ -1004,7 +1109,15 @@ esp_err_t http_server_start(void) {
         .user_ctx = NULL
     };
     httpd_register_uri_handler(server, &uri_api_status);
-    
+
+    httpd_uri_t uri_api_stats = {
+        .uri = "/api/stats",
+        .method = HTTP_GET,
+        .handler = api_stats_get_handler,
+        .user_ctx = NULL
+    };
+    httpd_register_uri_handler(server, &uri_api_stats);
+
     httpd_uri_t uri_api_toggle = {
         .uri = "/api/toggle",
         .method = HTTP_POST,

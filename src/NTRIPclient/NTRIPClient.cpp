@@ -47,7 +47,7 @@
 static const char* TAG = "NTRIPClient";
 
 // Timeout (seconds) for the initial connect + status-line read.
-static const int NTRIP_CONNECT_TIMEOUT_SEC = 15;
+static const int NTRIP_CONNECT_TIMEOUT_SEC = 30;
 // Read timeout for the streaming phase. Keep short so the task loop can
 // service the GGA queue promptly between RTCM reads.
 static const int NTRIP_STREAM_READ_TIMEOUT_MS = 100;
@@ -194,8 +194,15 @@ bool NTRIPClient::reqRaw(const char* host, int &port, const char* mntpnt,
     int yes = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 
-    // Enable keepalive so a silent caster eventually closes our side.
+    // Enable keepalive so a silent caster eventually closes our side. lwIP's
+    // built-in defaults are idle=7200 s / intvl=75 s / cnt=9 — useless when a
+    // 4G/MiFi handover silently kills the flow. Override per-socket so dead
+    // sessions are detected in ~60 s (30 + 3 × 10) rather than ~2 h.
     setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    int keepidle = 30, keepintvl = 10, keepcnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &keepidle,  sizeof(keepidle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &keepcnt,   sizeof(keepcnt));
 
     // Send the GET request (loop in case of short writes)
     int sent_total = 0;

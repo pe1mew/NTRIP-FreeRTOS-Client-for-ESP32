@@ -57,8 +57,12 @@ extern "C" {
 
 /**
  * @brief Maximum length of a telemetry JSON payload (de-stuffed, without framing).
+ *
+ * Must match the emulator's EMUL_JSON_BUF_SIZE. Sizing smaller than the wire
+ * payload causes the RX state machine to overflow the accumulator silently
+ * and drop every frame — see data_output_get_rx_frame_overflows().
  */
-#define TELEMETRY_JSON_MAX_LEN  512
+#define TELEMETRY_JSON_MAX_LEN  1024
 
 /**
  * @brief Message struct passed through the JSON forwarding queue.

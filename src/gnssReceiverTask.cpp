@@ -12,6 +12,7 @@
 #include <driver/gpio.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_task_wdt.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -258,7 +259,10 @@ static void gnss_receiver_task(void *pvParameters) {
     uint16_t gga_interval_sec = DEFAULT_GGA_INTERVAL_SEC;
     
     ESP_LOGI(TAG, "GNSS Receiver Task started");
-    
+
+    // Subscribe this task to the IDF task watchdog. Loop must reset() each pass.
+    esp_task_wdt_add(NULL);
+
     // Initialize UART
     if (init_gnss_uart() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize GNSS UART, task exiting");
@@ -283,6 +287,9 @@ static void gnss_receiver_task(void *pvParameters) {
             }
             gnss_prev_loop_us = now_loop_us;
         }
+
+        // Feed the task watchdog.
+        esp_task_wdt_reset();
 
         // Check for RTCM data from NTRIP Client
         rtcm_data_t rtcm_data;

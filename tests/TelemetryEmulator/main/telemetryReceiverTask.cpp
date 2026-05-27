@@ -19,7 +19,7 @@
 #define RECV_TX_PIN          GPIO_NUM_4       /* defined, not wired */
 #define RECV_BAUD_RATE       115200
 #define RECV_BUF_SIZE        1024
-#define RECV_FRAME_BUF_SIZE  512  /* must be >= EMUL_JSON_BUF_SIZE + 2 CRC bytes */
+#define RECV_FRAME_BUF_SIZE  1024 /* must be >= EMUL_JSON_BUF_SIZE + 2 CRC bytes */
 #define RECV_TASK_STACK_SIZE 4096
 #define RECV_TASK_PRIORITY   5
 
@@ -45,10 +45,12 @@ static void telemetry_receiver_task(void *arg)
 {
     ESP_LOGI(TAG, "Telemetry Receiver Task started, listening on UART1 RX=GPIO5");
 
-    /* Read buffer — raw bytes from UART ring buffer */
-    uint8_t rx_buf[RECV_BUF_SIZE];
-    /* Decoded frame accumulator (payload bytes + 2 CRC bytes after de-stuffing) */
-    uint8_t frame_buf[RECV_FRAME_BUF_SIZE];
+    /* Read buffer — raw bytes from UART ring buffer.
+     * static (BSS) so the 1 KB does not consume task stack. */
+    static uint8_t rx_buf[RECV_BUF_SIZE];
+    /* Decoded frame accumulator (payload bytes + 2 CRC bytes after de-stuffing).
+     * static (BSS) so the 1 KB does not consume task stack. */
+    static uint8_t frame_buf[RECV_FRAME_BUF_SIZE];
     int     frame_len = 0;
 
     frame_state_t state = STATE_WAIT_SOH;

@@ -17,6 +17,8 @@
 #include "statisticsTask.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
+#include "esp_task_wdt.h"
 #include <freertos/event_groups.h>
 #include <cstring>
 
@@ -79,7 +81,9 @@ static uint8_t rtcm_buffer[RTCM_BUFFER_SIZE];
 static size_t rtcm_buffer_len = 0;
 
 // Queue configuration
-#define RTCM_QUEUE_LENGTH   10  // Can buffer 10 RTCM messages
+// RTCM_QUEUE_LENGTH 50 ≈ 12 s of corrections at ~4 msg/s. Sized to ride out
+// short MiFi outages without losing RTK Fixed. Overflow path is drop-oldest.
+#define RTCM_QUEUE_LENGTH   50
 #define GGA_QUEUE_LENGTH    5   // Can buffer 5 GGA sentences
 
 // Task configuration
@@ -221,11 +225,18 @@ static void ntrip_client_task(void* pvParameters) {
     ntrip_config_t ntrip_config;
     int64_t last_gga_time = 0;
     int64_t last_connect_attempt = 0;
+    // Exponential backoff with jitter: next_delay = min(base * 2^n, 60) + rand(0, base/2).
+    // Reset to 0 on successful CONNECTED to drop back to the base delay.
+    uint32_t n_consecutive_failures = 0;
     bool reconnect_needed = false;
     int64_t last_config_poll = 0; // microseconds
     
     ESP_LOGI(TAG, "NTRIP Client Task started");
-    
+
+    // Subscribe this task to the IDF task watchdog. WDT timeout is set by
+    // sdkconfig (CONFIG_ESP_TASK_WDT_TIMEOUT_S). Loop must call reset() below.
+    esp_task_wdt_add(NULL);
+
     // Get initial configuration
     if (config_get_ntrip(&ntrip_config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to get initial NTRIP configuration");
@@ -245,6 +256,11 @@ static void ntrip_client_task(void* pvParameters) {
             ntrip_loop_count++;
         }
         ntrip_prev_loop_us = now_loop_us;
+
+        // Feed the task watchdog. If this loop ever stops iterating, the WDT
+        // fires (configured to reset, not panic). 10 s timeout vs. our ~100 ms
+        // loop time gives 100× headroom.
+        esp_task_wdt_reset();
 
         // Poll for configuration changes and clear handled bits (matches MQTT behavior)
         EventBits_t bits = xEventGroupGetBits(config_events);
@@ -332,9 +348,16 @@ static void ntrip_client_task(void* pvParameters) {
             
             int64_t now = esp_timer_get_time();
             int64_t time_since_last_attempt = (now - last_connect_attempt) / 1000000;
-            
+
+            // Exponential backoff with jitter for this attempt.
+            uint32_t base = ntrip_config.reconnect_delay_sec ? ntrip_config.reconnect_delay_sec : 5;
+            uint32_t shift = n_consecutive_failures > 6 ? 6 : n_consecutive_failures;  // cap at 64x
+            uint32_t backoff_sec = base * (1u << shift);
+            if (backoff_sec > 60) backoff_sec = 60;
+            backoff_sec += esp_random() % ((base / 2) + 1);  // jitter
+
             // Check if enough time has passed since last connection attempt
-            if (reconnect_needed || time_since_last_attempt >= ntrip_config.reconnect_delay_sec) {
+            if (reconnect_needed || time_since_last_attempt >= (int64_t)backoff_sec) {
                 last_connect_attempt = now;
                 reconnect_needed = false;
 
@@ -348,14 +371,19 @@ static void ntrip_client_task(void* pvParameters) {
                 // Initialize client
                 if (!client->init()) {
                     ESP_LOGE(TAG, "Failed to initialize NTRIP client");
-                    vTaskDelay(pdMS_TO_TICKS(ntrip_config.reconnect_delay_sec * 1000));
+                    n_consecutive_failures++;
+                    vTaskDelay(pdMS_TO_TICKS(base * 1000));
                     continue;
                 }
 
                 // Convert port to int for NTRIPClient API (expects int&)
                 int port = ntrip_config.port;
 
-                // Connect to NTRIP caster
+                // Connect to NTRIP caster. reqRaw() may block up to
+                // NTRIP_CONNECT_TIMEOUT_SEC (30 s) which exceeds the task
+                // watchdog timeout — temporarily de-subscribe so a slow
+                // network handshake doesn't cause a false-positive reset.
+                esp_task_wdt_delete(NULL);
                 bool connect_success = false;
                 if (strlen(ntrip_config.user) > 0) {
                     connect_success = client->reqRaw(ntrip_config.host, port,
@@ -365,16 +393,20 @@ static void ntrip_client_task(void* pvParameters) {
                     connect_success = client->reqRaw(ntrip_config.host, port,
                                                      ntrip_config.mountpoint);
                 }
+                esp_task_wdt_add(NULL);
+                esp_task_wdt_reset();
 
                 if (connect_success && client->isConnected()) {
                     ntrip_connected = true;
                     ntrip_connection_start = time(NULL);
                     last_gga_time = -1; // Set to -1 to trigger immediate GGA send on first message
+                    n_consecutive_failures = 0;  // success — clear backoff
                     statistics_ntrip_event(NTRIP_STATS_EVENT_CONNECTED);
                     ESP_LOGI(TAG, "Successfully connected to NTRIP caster, waiting for first GGA");
                 } else {
-                    ESP_LOGW(TAG, "Failed to connect to NTRIP caster, will retry in %d seconds",
-                             ntrip_config.reconnect_delay_sec);
+                    n_consecutive_failures++;
+                    ESP_LOGW(TAG, "Failed to connect to NTRIP caster (attempt %lu), next try in ~%lu s",
+                             (unsigned long)n_consecutive_failures, (unsigned long)backoff_sec);
                     client->disconnect();
                     ntrip_connected = false;
                     // Best-effort auth-vs-other distinction: NTRIPClient logs the
@@ -470,8 +502,14 @@ static void ntrip_client_task(void* pvParameters) {
                 // or if the interval has elapsed
                 int64_t now = esp_timer_get_time();
                 int64_t time_since_last_gga = (last_gga_time == -1) ? INT64_MAX : (now - last_gga_time) / 1000000;
-                
-                if (last_gga_time == -1 || time_since_last_gga >= ntrip_config.gga_interval_sec) {
+
+                // Effective interval = configured × quality multiplier. Stretches
+                // GGA cadence when the uplink is degraded so we don't burn bandwidth
+                // pushing position updates the caster can't ACK promptly anyway.
+                uint8_t mult_x10 = network_quality_interval_mult_x10(network_quality_classify());
+                uint32_t effective_interval_sec = ((uint32_t)ntrip_config.gga_interval_sec * mult_x10) / 10;
+
+                if (last_gga_time == -1 || time_since_last_gga >= (int64_t)effective_interval_sec) {
                     client->sendGGA(gga_msg.sentence);
                     last_gga_time = now;
                     // Only log task-level success if sendGGA didn't flip the
@@ -480,8 +518,8 @@ static void ntrip_client_task(void* pvParameters) {
                     // caster's TCP RST means nothing actually reached it.
                     if (client->isConnected()) {
                         if (time_since_last_gga == INT64_MAX) {
-                            ESP_LOGI(TAG, "Sent first GGA to NTRIP server, starting %d sec interval: %s",
-                                     ntrip_config.gga_interval_sec, gga_msg.sentence);
+                            ESP_LOGI(TAG, "Sent first GGA to NTRIP server, starting %lu sec interval: %s",
+                                     (unsigned long)effective_interval_sec, gga_msg.sentence);
                         } else {
                             ESP_LOGI(TAG, "Sent GGA to NTRIP server: %s", gga_msg.sentence);
                         }
@@ -491,8 +529,8 @@ static void ntrip_client_task(void* pvParameters) {
                     // (`if (!client->isConnected())`) will set reconnect_needed
                     // and the next loop iteration takes the reconnect path.
                 } else {
-                    ESP_LOGD(TAG, "GGA received but interval not elapsed yet (%lld/%d sec)", 
-                             time_since_last_gga, ntrip_config.gga_interval_sec);
+                    ESP_LOGD(TAG, "GGA received but interval not elapsed yet (%lld/%lu sec)",
+                             time_since_last_gga, (unsigned long)effective_interval_sec);
                 }
             }
             // Note: previously there was an "else" branch here that updated

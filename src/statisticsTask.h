@@ -169,6 +169,38 @@ typedef enum {
 } ntrip_stats_event_t;
 
 /**
+ * @brief Network quality classification derived from period statistics.
+ *
+ * Used by NTRIP/MQTT tasks to stretch their send/publish intervals when the
+ * uplink is unreliable, reducing retransmits and freeing the radio.
+ */
+typedef enum {
+    NETWORK_QUALITY_EXCELLENT = 0,
+    NETWORK_QUALITY_GOOD,
+    NETWORK_QUALITY_DEGRADED,
+    NETWORK_QUALITY_POOR,
+    NETWORK_QUALITY_CRITICAL,
+} network_quality_t;
+
+/**
+ * @brief Classify current network quality from period stats.
+ *
+ * Combines wifi_rssi_avg, rtcm_data_gaps, ntrip_timeouts and wifi_reconnect_count
+ * for the current period; returns the worst of the per-input verdicts.
+ */
+network_quality_t network_quality_classify(void);
+
+/**
+ * @brief Interval multiplier for the given quality, in tenths.
+ *
+ * 10 = 1.0×, 15 = 1.5×, 30 = 3.0×. Returns 10 for unknown/excellent so callers
+ * that forget to gate on quality see no change in cadence.
+ *
+ *   effective_sec = (configured_sec * network_quality_interval_mult_x10(q)) / 10
+ */
+uint8_t network_quality_interval_mult_x10(network_quality_t q);
+
+/**
  * @brief Initialize the Statistics Task
  *
  * Creates the statistics task and initializes all counters to zero.

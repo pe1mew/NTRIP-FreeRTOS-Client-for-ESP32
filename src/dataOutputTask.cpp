@@ -64,6 +64,23 @@ extern "C" {
 // Queue for forwarding received telemetry JSON to the MQTT task
 static QueueHandle_t s_json_queue = NULL;
 
+// Diagnostic: total raw bytes ever read from UART1 RX. Counts every byte the
+// uart driver hands us, before framing/CRC. Lets us distinguish "no bytes on
+// the line" from "bytes arrive but framing fails".
+static volatile uint32_t telemetry_rx_bytes_total = 0;
+// Diagnostic: frames discarded because they exceeded TELEMETRY_JSON_MAX_LEN.
+// A non-zero value means the upstream emitter is producing larger payloads
+// than this device can buffer — bump TELEMETRY_JSON_MAX_LEN to match.
+static volatile uint32_t telemetry_rx_frame_overflows = 0;
+
+extern "C" uint32_t data_output_get_rx_bytes_total(void) {
+    return telemetry_rx_bytes_total;
+}
+
+extern "C" uint32_t data_output_get_rx_frame_overflows(void) {
+    return telemetry_rx_frame_overflows;
+}
+
 // UART configuration
 #define OUTPUT_UART_NUM         TELEMETRY_UART_NUM
 #define OUTPUT_TX_PIN           TELEMETRY_TX_PIN
@@ -158,6 +175,7 @@ static void process_rx_frames(void) {
 
     uint8_t b;
     while (uart_read_bytes(OUTPUT_UART_NUM, &b, 1, 0) == 1) {
+        telemetry_rx_bytes_total++;
         if (state == WAIT_SOH) {
             if (b == FRAME_SOH) {
                 buf_len = 0;
@@ -173,6 +191,7 @@ static void process_rx_frames(void) {
                     buf[buf_len++] = b;
                 } else {
                     // Buffer overflow — discard frame
+                    telemetry_rx_frame_overflows++;
                     ESP_LOGW(TAG, "RX frame buffer overflow, discarding");
                     state = WAIT_SOH;
                 }

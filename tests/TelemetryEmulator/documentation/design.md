@@ -511,31 +511,61 @@ esp_err_t sensor_emulator_task_init(void);
 
 The byte-stuffing and CRC-16/CCITT-FALSE rules are **identical** to the protocol decoded by `telemetryReceiverTask` (see §3). The JSON payload is pure printable ASCII so control bytes (`0x01`, `0x10`, `0x18`) cannot appear in the payload in practice, but the stuffing loop handles them correctly regardless. The two CRC bytes are stuffed independently.
 
-**JSON output schema** (see `documentation/json.md` for the full field reference):
+**JSON output schema** (see `documentation/json.md` for the full field reference;
+mirrors the CSV payload tags in `documentation/framedCRCString.md`):
 
 ```json
 {"seq":N,"tim":"HH:MM:SS.mmm",
- "vhl":{"thr":{min,max,avg},"spd":{min,max,avg},"lat":F,"lon":F},
- "mtr":{"pwr":{min,max,avg},"rpm":{min,max,avg},"trq":{min,max,avg}},
- "spc":{"vsc":{min,max,avg},"fsa":{min,max,avg},"tankP":F}}
+ "vhl":{
+   "acc":{"x":{min,max,avg},"y":{min,max,avg},"z":{min,max,avg}},
+   "thr":{"val":{min,max,avg},
+          "ctrlMode":I,"mtrMode":I,"swEn":I,"dbgMode":I},
+   "spd":{min,max,avg},"lat":F,"lon":F},
+ "mtr":{
+   "mtl":{"ctrl":{min,max,avg},
+          "ctrlMode":I,"mtrMode":I,"swEn":I,"state":I,
+          "trq":{min,max,avg},"rpm":{min,max,avg},"tmp":{min,max,avg}},
+   "mpw":{"pwr":{min,max,avg},"cur":{min,max,avg}}},
+ "spc":{"fan":I,"h2P1":F,"h2P2":F,"tankP":F,"vsc":F,"fsa":F}}
 ```
 
-`lat` and `lon` are scalars sourced from the most recent NTRIP-Client frame decoded by `telemetryReceiverTask`; all other fields are `{min, max, avg}` aggregates computed by Welford's algorithm over the publish window.
+`lat`/`lon` are scalars sourced from the most recent NTRIP-Client frame
+decoded by `telemetryReceiverTask`. All `spc.*` fields are last-received
+scalars (per CSV-protocol §8.6 — Spectronik data is not aggregated). Discrete
+enum/state fields (`ctrlMode`, `mtrMode`, `swEn`, `state`, `dbgMode`) are
+last-received values driven by a slow cycler. Every `{min, max, avg}` aggregate
+is computed by Welford's algorithm over the publish window.
 
 **Waveform assignments:**
 
-| JSON key | Range | Waveform | Period | Published as |
-|----------|-------|----------|--------|--------------|
-| `thr` | 0 … 100 % | trapezoid |  60 s | `{min, max, avg}` |
-| `spd` | 0.0 … 10.0 m/s | triangle | 120 s | `{min, max, avg}` |
-| `lat` | signed decimal ° | — | — | scalar (NTRIP receiver) |
-| `lon` | signed decimal ° | — | — | scalar (NTRIP receiver) |
-| `pwr` | −1000 … +1000 W | sine |  60 s | `{min, max, avg}` |
-| `rpm` | −10000 … +10000 RPM | cosine | 120 s | `{min, max, avg}` |
-| `trq` | −100 … +100 Nm | square |   6 s | `{min, max, avg}` |
-| `vsc` | 0.0 … 100.0 V | triangle |  15 s | `{min, max, avg}` |
-| `fsa` | 0.0 … 50.0 A | trapezoid |  12 s | `{min, max, avg}` |
-| `tankP` | 0.00 … 500.00 Bar | trapezoid | 240 s | scalar (latest) |
+| JSON path | Range | Waveform | Period | Published as |
+|-----------|-------|----------|--------|--------------|
+| `vhl.acc.x` | −4096 … +4096 counts | sine |   3 s | `{min, max, avg}` |
+| `vhl.acc.y` | −4096 … +4096 counts | cosine |   3 s | `{min, max, avg}` |
+| `vhl.acc.z` |  −512 … +4096 counts | triangle |   5 s | `{min, max, avg}` |
+| `vhl.thr.val` | 0.0 … 100.0 % | trapezoid |  60 s | `{min, max, avg}` |
+| `vhl.thr.ctrlMode` | 0 … 1 | cycle |  30 s | scalar (last) |
+| `vhl.thr.mtrMode`  | 0 … 7 | cycle |  30 s | scalar (last) |
+| `vhl.thr.swEn`     | 0 … 1 | cycle |  60 s | scalar (last) |
+| `vhl.thr.dbgMode`  | 0 … 1 | cycle |  90 s | scalar (last) |
+| `vhl.spd` | 0.0 … 10.0 m/s | triangle | 120 s | `{min, max, avg}` |
+| `vhl.lat` / `vhl.lon` | signed decimal ° | — | — | scalar (NTRIP receiver) |
+| `mtr.mtl.ctrl` | −100.0 … +100.0 | sine |  20 s | `{min, max, avg}` |
+| `mtr.mtl.ctrlMode` | 0 … 1 | cycle |  30 s | scalar (last) |
+| `mtr.mtl.mtrMode`  | 0 … 7 | cycle |  45 s | scalar (last) |
+| `mtr.mtl.swEn`     | 0 … 1 | cycle |  60 s | scalar (last) |
+| `mtr.mtl.state`    | 0 … 3 | cycle |  30 s | scalar (last) |
+| `mtr.mtl.trq` | −100 … +100 Nm | square |   6 s | `{min, max, avg}` |
+| `mtr.mtl.rpm` | −10000 … +10000 RPM | cosine | 120 s | `{min, max, avg}` |
+| `mtr.mtl.tmp` | 25 … 85 °C | trapezoid | 300 s | `{min, max, avg}` |
+| `mtr.mpw.pwr` | −1000 … +1000 W | sine |  60 s | `{min, max, avg}` |
+| `mtr.mpw.cur` | 0 … 200 A | triangle |  15 s | `{min, max, avg}` |
+| `spc.fan` | 0 … 100 % | trapezoid |  45 s | scalar (last) |
+| `spc.h2P1` | 0.30 … 0.70 bar | sine |  10 s | scalar (last) |
+| `spc.h2P2` | 0.30 … 0.70 bar | cosine |  10 s | scalar (last) |
+| `spc.tankP` | 0.00 … 500.00 bar | trapezoid | 240 s | scalar (last) |
+| `spc.vsc` | 0.0 … 100.0 V | triangle |  15 s | scalar (last) |
+| `spc.fsa` | 0.0 … 50.0 A | trapezoid |  12 s | scalar (last) |
 
 **Waveform formulae** (continuous-time, all periods independent):
 

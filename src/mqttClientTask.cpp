@@ -15,6 +15,8 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_random.h"
+#include "esp_task_wdt.h"
 #include "esp_wifi.h"
 #include "mqtt_client.h"
 
@@ -36,6 +38,12 @@ static uint32_t total_published = 0;
 static time_t mqtt_connection_start = 0;
 static uint32_t mqtt_uptime_accumulated = 0;
 static time_t last_activity_time = 0;
+
+// Staggered reconnect: when MQTT disconnects within ~10 s of WiFi STA recovery,
+// defer the next connect attempt by 5..10 s to avoid racing NTRIP for bandwidth.
+static int64_t wifi_up_since_us = 0;          // set on STA up, cleared on STA down
+static volatile bool mqtt_stagger_requested = false;
+static int64_t mqtt_restart_at_us = 0;        // when to call esp_mqtt_client_start (0 = no pending)
 
 // Forward declarations
 static void mqtt_task(void *pvParameters);
@@ -114,15 +122,27 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "MQTT disconnected from broker");
-            
+
             // Accumulate uptime before disconnecting
             if (mqtt_connection_start > 0) {
                 gettimeofday(&tv, NULL);
                 mqtt_uptime_accumulated += (tv.tv_sec - mqtt_connection_start);
                 mqtt_connection_start = 0;
             }
-            
+
             mqtt_connected = false;
+
+            // If WiFi just came up, defer the auto-reconnect by 5..10 s so MQTT
+            // doesn't race NTRIP for bandwidth. Actual stop/restart is done by
+            // the main loop — esp_mqtt_client_stop() may not be called here.
+            {
+                int64_t now = esp_timer_get_time();
+                if (wifi_up_since_us != 0 && (now - wifi_up_since_us) < 10LL * 1000000LL) {
+                    uint32_t jitter_ms = esp_random() % 5000;  // 0..5 s
+                    mqtt_restart_at_us = now + (5000LL + (int64_t)jitter_ms) * 1000LL;
+                    mqtt_stagger_requested = true;
+                }
+            }
             break;
             
         case MQTT_EVENT_PUBLISHED:
@@ -150,10 +170,13 @@ static void mqtt_task(void *pvParameters) {
     uint32_t stats_counter = 0;
     
     ESP_LOGI(TAG, "MQTT client task started");
-    
+
+    // Subscribe this task to the IDF task watchdog. Loop must reset() each pass.
+    esp_task_wdt_add(NULL);
+
     // Get configuration event group for monitoring changes
     EventGroupHandle_t config_events = config_get_event_group();
-    
+
     // Load configuration
     if (config_manager_get_mqtt_config(&config) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to load MQTT configuration");
@@ -195,6 +218,36 @@ static void mqtt_task(void *pvParameters) {
     
     // Main loop
     while (1) {
+        // Feed the task watchdog.
+        esp_task_wdt_reset();
+
+        // Track WiFi STA up-time for staggered-reconnect decisions in the
+        // MQTT event handler. Updated each iteration of the 1-second tick.
+        {
+            bool sta_now = wifi_manager_is_sta_connected();
+            if (sta_now && wifi_up_since_us == 0) {
+                wifi_up_since_us = esp_timer_get_time();
+            } else if (!sta_now && wifi_up_since_us != 0) {
+                wifi_up_since_us = 0;
+            }
+        }
+
+        // Service deferred stagger from MQTT_EVENT_DISCONNECTED. Stopping the
+        // client cancels the library's default auto-reconnect timer, then we
+        // re-start it after the jittered delay below.
+        if (mqtt_stagger_requested && mqtt_client != NULL) {
+            ESP_LOGI(TAG, "Staggering MQTT reconnect after WiFi recovery");
+            esp_mqtt_client_stop(mqtt_client);
+            mqtt_stagger_requested = false;
+        }
+        if (mqtt_restart_at_us != 0 && esp_timer_get_time() >= mqtt_restart_at_us) {
+            if (config.enabled && mqtt_client != NULL) {
+                ESP_LOGI(TAG, "Restarting MQTT client after stagger delay");
+                esp_mqtt_client_start(mqtt_client);
+            }
+            mqtt_restart_at_us = 0;
+        }
+
         // Check for configuration changes (non-blocking)
         EventBits_t bits = xEventGroupGetBits(config_events);
         if (bits & CONFIG_MQTT_CHANGED_BIT) {
@@ -328,14 +381,22 @@ static void mqtt_task(void *pvParameters) {
         if (config.gnss_interval_sec > 0) gnss_counter++;
         if (config.status_interval_sec > 0) status_counter++;
         if (config.stats_interval_sec > 0) stats_counter++;
-        
-        ESP_LOGD(TAG, "Counters - GNSS:%lu/%u, Status:%lu/%u, Stats:%lu/%u", 
+
+        // Effective intervals = configured × quality multiplier (10 = 1.0×).
+        // Stretches publish cadence on degraded networks; configured == 0 still
+        // means "disabled" so we don't divide a disabled stream up by quality.
+        uint8_t mult_x10 = network_quality_interval_mult_x10(network_quality_classify());
+        uint32_t eff_gnss_interval   = ((uint32_t)config.gnss_interval_sec   * mult_x10) / 10;
+        uint32_t eff_status_interval = ((uint32_t)config.status_interval_sec * mult_x10) / 10;
+        uint32_t eff_stats_interval  = ((uint32_t)config.stats_interval_sec  * mult_x10) / 10;
+
+        ESP_LOGD(TAG, "Counters - GNSS:%lu/%u, Status:%lu/%u, Stats:%lu/%u",
                  gnss_counter, config.gnss_interval_sec,
                  status_counter, config.status_interval_sec,
                  stats_counter, config.stats_interval_sec);
-        
+
         // Publish GNSS position data (only if interval > 0)
-        if (config.gnss_interval_sec > 0 && gnss_counter >= config.gnss_interval_sec) {
+        if (config.gnss_interval_sec > 0 && gnss_counter >= eff_gnss_interval) {
             gnss_counter = 0;
             
             gnss_data_t gnss_data;
@@ -382,7 +443,7 @@ static void mqtt_task(void *pvParameters) {
         }
         
         // Publish system status (cumulative runtime data, only if interval > 0)
-        if (config.status_interval_sec > 0 && status_counter >= config.status_interval_sec) {
+        if (config.status_interval_sec > 0 && status_counter >= eff_status_interval) {
             status_counter = 0;
             
             mqtt_status_message_t status_msg = {};
@@ -405,13 +466,13 @@ static void mqtt_task(void *pvParameters) {
         }
         
         // Publish period statistics (only if interval > 0)
-        if (config.stats_interval_sec > 0 && stats_counter >= config.stats_interval_sec) {
+        if (config.stats_interval_sec > 0 && stats_counter >= eff_stats_interval) {
             stats_counter = 0;
             
             mqtt_stats_message_t stats_msg = {};
             collect_period_statistics(&stats_msg);
-            
-            char json_buffer[1024];
+
+            char json_buffer[1536];
             format_stats_json(&stats_msg, json_buffer, sizeof(json_buffer));
             
             char topic[128];
@@ -561,15 +622,24 @@ static void collect_period_statistics(mqtt_stats_message_t *msg) {
     msg->wifi_rssi_min = period_stats.wifi_rssi_min;
     msg->wifi_rssi_max = period_stats.wifi_rssi_max;
     msg->wifi_uptime_percent = period_stats.wifi_uptime_percent;
-    
+    msg->wifi_reconnect_count = period_stats.wifi_reconnect_count;
+
     // System metrics
     msg->gnss_update_rate_hz = period_stats.gnss_update_rate_hz;
-    
+
     // Error metrics
     msg->nmea_errors = period_stats.nmea_checksum_errors;
     msg->uart_errors = period_stats.uart_errors;
     msg->rtcm_queue_overflows = period_stats.rtcm_queue_overflows;
     msg->ntrip_timeouts = period_stats.ntrip_timeouts;
+
+    // Network performance summary
+    msg->network_quality              = (uint8_t)network_quality_classify();
+    msg->rtcm_gap_duration_sec        = period_stats.rtcm_gap_duration_sec;
+    msg->rtcm_queue_peak_count        = runtime_stats.rtcm_queue_peak_count;
+    msg->rtcm_queue_overflows_total   = runtime_stats.rtcm_queue_overflows_total;
+    msg->ntrip_reconnect_count        = runtime_stats.ntrip_reconnect_count;
+    msg->ntrip_avg_reconnect_time_ms  = runtime_stats.ntrip_avg_reconnect_time_ms;
 }
 
 // Format GNSS JSON message
@@ -684,13 +754,22 @@ static void format_stats_json(const mqtt_stats_message_t *msg, char *buffer, siz
         "      \"rssi_avg\": %d,\n"
         "      \"rssi_min\": %d,\n"
         "      \"rssi_max\": %d,\n"
-        "      \"uptime_percent\": %.1f\n"
+        "      \"uptime_percent\": %.1f,\n"
+        "      \"reconnects\": %lu\n"
         "   },\n"
         "   \"errors\": {\n"
         "      \"nmea_checksum\": %lu,\n"
         "      \"uart\": %lu,\n"
         "      \"rtcm_queue_overflow\": %lu,\n"
         "      \"ntrip_timeouts\": %lu\n"
+        "   },\n"
+        "   \"network\": {\n"
+        "      \"quality\": %u,\n"
+        "      \"rtcm_gap_duration_sec\": %lu,\n"
+        "      \"rtcm_queue_peak\": %lu,\n"
+        "      \"rtcm_queue_overflows_total\": %lu,\n"
+        "      \"ntrip_reconnect_count\": %lu,\n"
+        "      \"ntrip_avg_reconnect_time_ms\": %lu\n"
         "   }\n"
         "}",
         msg->timestamp,
@@ -721,9 +800,16 @@ static void format_stats_json(const mqtt_stats_message_t *msg, char *buffer, siz
         msg->wifi_rssi_min,
         msg->wifi_rssi_max,
         msg->wifi_uptime_percent,
+        msg->wifi_reconnect_count,
         msg->nmea_errors,
         msg->uart_errors,
         msg->rtcm_queue_overflows,
-        msg->ntrip_timeouts
+        msg->ntrip_timeouts,
+        msg->network_quality,
+        msg->rtcm_gap_duration_sec,
+        msg->rtcm_queue_peak_count,
+        msg->rtcm_queue_overflows_total,
+        msg->ntrip_reconnect_count,
+        msg->ntrip_avg_reconnect_time_ms
     );
 }

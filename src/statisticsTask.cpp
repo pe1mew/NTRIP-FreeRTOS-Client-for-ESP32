@@ -101,6 +101,8 @@ static uint32_t rtcm_latency_count = 0;
 static uint64_t rtcm_queue_depth_sum = 0;
 static uint64_t gga_queue_depth_sum = 0;
 static uint32_t queue_depth_sample_count = 0;
+// Edge-triggered RTCM watermark warning — one log per period when depth ≥ 75%.
+static bool rtcm_watermark_warned_this_period = false;
 
 // NTRIP reconnect timing (between RECONNECT_BEGIN and CONNECTED)
 static int64_t ntrip_reconnect_begin_us = 0;
@@ -191,6 +193,9 @@ static void reset_period_stats(void) {
         rtcm_latency_sum_ms = 0;
         rtcm_latency_count = 0;
 
+        // Allow the RTCM watermark warning to fire again next period.
+        rtcm_watermark_warned_this_period = false;
+
         // Reset queue-depth, reconnect-timing and gga-interval accumulators
         rtcm_queue_depth_sum = 0;
         gga_queue_depth_sum = 0;
@@ -271,9 +276,17 @@ static void collect_stack_hwm(void) {
 static void collect_queue_stats(void) {
     if (rtcm_queue != NULL) {
         UBaseType_t d = uxQueueMessagesWaiting(rtcm_queue);
+        UBaseType_t total = d + uxQueueSpacesAvailable(rtcm_queue);
         rtcm_queue_depth_sum += d;
         if ((uint32_t)d > stats.runtime.rtcm_queue_peak_count) {
             stats.runtime.rtcm_queue_peak_count = (uint32_t)d;
+        }
+        // Edge-triggered: one warning per period if depth crosses 75%. Cleared
+        // by reset_period_stats() so we can re-fire next period.
+        if (!rtcm_watermark_warned_this_period && total > 0 && d * 4 >= total * 3) {
+            ESP_LOGW(TAG, "RTCM queue at %u/%u (>=75%%) — uplink may be lagging",
+                     (unsigned)d, (unsigned)total);
+            rtcm_watermark_warned_this_period = true;
         }
     }
     if (gga_queue != NULL) {
@@ -777,18 +790,61 @@ void statistics_get_period(period_statistics_t* out_stats) {
     if (out_stats != NULL && xSemaphoreTake(stats_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         // Copy period stats
         memcpy(out_stats, &stats.period, sizeof(period_statistics_t));
-        
+
         // Calculate rates on-the-fly if period duration is available
         struct timeval tv;
         gettimeofday(&tv, NULL);
         uint32_t period_sec = tv.tv_sec - stats.period_start_time;
-        
+
         if (period_sec > 0) {
             out_stats->rtcm_bytes_per_sec = stats.period.rtcm_bytes_received / period_sec;
             out_stats->rtcm_message_rate = stats.period.rtcm_messages_received / period_sec;
         }
-        
+
         xSemaphoreGive(stats_mutex);
+    }
+}
+
+// Classify a single dimension into the worst-matching quality bucket. Higher
+// enum value = worse — caller takes max() across dimensions.
+static network_quality_t classify_rssi(int8_t rssi) {
+    // rssi == 0 means "no samples yet" (period just reset / WiFi not up).
+    // Treat as EXCELLENT so a fresh period doesn't immediately stretch intervals.
+    if (rssi == 0)         return NETWORK_QUALITY_EXCELLENT;
+    if (rssi >= -60)       return NETWORK_QUALITY_EXCELLENT;
+    if (rssi >= -70)       return NETWORK_QUALITY_GOOD;
+    if (rssi >= -80)       return NETWORK_QUALITY_DEGRADED;
+    if (rssi >= -85)       return NETWORK_QUALITY_POOR;
+    return NETWORK_QUALITY_CRITICAL;
+}
+
+static network_quality_t classify_count(uint32_t count) {
+    if (count == 0) return NETWORK_QUALITY_EXCELLENT;
+    if (count == 1) return NETWORK_QUALITY_DEGRADED;
+    if (count == 2) return NETWORK_QUALITY_POOR;
+    return NETWORK_QUALITY_CRITICAL;
+}
+
+extern "C" network_quality_t network_quality_classify(void) {
+    period_statistics_t p;
+    statistics_get_period(&p);
+
+    network_quality_t worst = classify_rssi(p.wifi_rssi_avg);
+    network_quality_t q;
+    q = classify_count(p.rtcm_data_gaps);     if (q > worst) worst = q;
+    q = classify_count(p.ntrip_timeouts);     if (q > worst) worst = q;
+    q = classify_count(p.wifi_reconnect_count); if (q > worst) worst = q;
+    return worst;
+}
+
+extern "C" uint8_t network_quality_interval_mult_x10(network_quality_t q) {
+    switch (q) {
+        case NETWORK_QUALITY_EXCELLENT:
+        case NETWORK_QUALITY_GOOD:      return 10;  // 1.0×
+        case NETWORK_QUALITY_DEGRADED:  return 15;  // 1.5×
+        case NETWORK_QUALITY_POOR:
+        case NETWORK_QUALITY_CRITICAL:  return 30;  // 3.0×
+        default:                        return 10;
     }
 }
 
