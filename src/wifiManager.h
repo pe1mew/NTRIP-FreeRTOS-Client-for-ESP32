@@ -50,15 +50,6 @@ esp_err_t wifi_manager_init(void);
 esp_err_t wifi_manager_connect_sta(const char* ssid, const char* password);
 
 /**
- * @brief Disconnect from WiFi network in Station mode
- * 
- * Disconnects from the current WiFi network but keeps AP active.
- * 
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t wifi_manager_disconnect_sta(void);
-
-/**
  * @brief Get WiFi connection status
  * 
  * Retrieves the current WiFi status including AP and STA states.

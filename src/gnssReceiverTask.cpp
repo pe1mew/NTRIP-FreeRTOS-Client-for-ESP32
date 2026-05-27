@@ -38,6 +38,26 @@ EventGroupHandle_t gnss_event_group = NULL;
 // GNSS update rate tracking
 static uint32_t gga_update_count = 0;
 
+// Loop-time tracking (measured at start of each main-loop iteration; the
+// stats task queries the average periodically and resets).
+static int64_t gnss_prev_loop_us = 0;
+static uint64_t gnss_loop_time_sum_us = 0;
+static uint32_t gnss_loop_count = 0;
+
+extern "C" {
+    // Exported for statisticsTask.cpp.
+    TaskHandle_t gnss_task_get_handle(void) {
+        return gnss_task_handle;
+    }
+    uint32_t gnss_task_get_avg_loop_us_and_reset(void) {
+        uint32_t avg = (gnss_loop_count > 0)
+            ? (uint32_t)(gnss_loop_time_sum_us / gnss_loop_count) : 0;
+        gnss_loop_time_sum_us = 0;
+        gnss_loop_count = 0;
+        return avg;
+    }
+}
+
 // Calculate NMEA checksum
 static uint8_t calculate_nmea_checksum(const char *sentence) {
     uint8_t checksum = 0;
@@ -254,6 +274,16 @@ static void gnss_receiver_task(void *pvParameters) {
     }
     
     while (1) {
+        // Sample loop period for the per-task avg-loop-time stat.
+        {
+            int64_t now_loop_us = esp_timer_get_time();
+            if (gnss_prev_loop_us != 0) {
+                gnss_loop_time_sum_us += (uint64_t)(now_loop_us - gnss_prev_loop_us);
+                gnss_loop_count++;
+            }
+            gnss_prev_loop_us = now_loop_us;
+        }
+
         // Check for RTCM data from NTRIP Client
         rtcm_data_t rtcm_data;
         if (xQueueReceive(rtcm_queue, &rtcm_data, 0) == pdTRUE) {
@@ -435,18 +465,3 @@ bool gnss_has_valid_fix(void) {
     return valid;
 }
 
-void gnss_receiver_task_stop(void) {
-    if (gnss_task_handle != NULL) {
-        vTaskDelete(gnss_task_handle);
-        gnss_task_handle = NULL;
-        ESP_LOGI(TAG, "GNSS Receiver Task stopped");
-    }
-    
-    // Cleanup UART
-    uart_driver_delete(GNSS_UART_NUM);
-    
-    if (gnss_data_mutex != NULL) {
-        vSemaphoreDelete(gnss_data_mutex);
-        gnss_data_mutex = NULL;
-    }
-}

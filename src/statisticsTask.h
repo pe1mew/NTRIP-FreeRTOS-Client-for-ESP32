@@ -41,13 +41,11 @@ typedef struct {
     uint32_t ntrip_uptime_sec;                /**< NTRIP uptime in seconds */
     uint32_t ntrip_reconnect_count;           /**< Number of NTRIP reconnects */
     uint32_t ntrip_avg_reconnect_time_ms;     /**< Average NTRIP reconnect time (ms) */
-    uint32_t ntrip_auth_failures;             /**< NTRIP authentication failures */
     time_t last_connection_state_change;      /**< Last NTRIP connection state change timestamp */
     // RTCM metrics [Runtime]
     uint64_t rtcm_bytes_received_total;       /**< Total RTCM bytes received */
     uint32_t rtcm_messages_received_total;    /**< Total RTCM messages received */
     uint32_t rtcm_data_gaps_total;            /**< Total RTCM data gaps */
-    uint32_t rtcm_corrupted_count_total;      /**< Total RTCM corrupted messages */
     uint32_t rtcm_queue_overflows_total;      /**< Total RTCM queue overflows */
     // GPS fix metrics [Runtime]
     uint32_t time_to_first_fix_sec;           /**< Time to first GPS fix (sec) */
@@ -86,7 +84,6 @@ typedef struct {
     uint32_t uart_errors_total;               /**< Total UART errors */
     uint32_t ntrip_timeouts_total;            /**< Total NTRIP timeouts */
     uint32_t config_load_failures_total;      /**< Total config load failures */
-    uint32_t memory_alloc_failures_total;     /**< Total memory allocation failures */
     uint32_t task_creation_failures_total;    /**< Total task creation failures */
     // Telemetry JSON forwarding counters [Runtime]
     uint32_t telemetry_json_received;         /**< Total valid telemetry JSON frames received on UART1 RX */
@@ -105,7 +102,6 @@ typedef struct {
     uint32_t rtcm_avg_latency_ms;          /**< Average RTCM latency (ms) */
     uint32_t rtcm_data_gaps;               /**< RTCM data gaps this period */
     uint32_t rtcm_gap_duration_sec;        /**< RTCM gap duration (sec) */
-    uint32_t rtcm_corrupted_count;         /**< RTCM corrupted messages this period */
     uint32_t rtcm_queue_overflows;         /**< RTCM queue overflows this period */
     // GPS fix metrics [Period]
     uint32_t fix_quality_duration[9];      /**< Seconds in each fix quality state this period */
@@ -158,24 +154,27 @@ typedef struct {
 typedef struct {
     runtime_statistics_t runtime;        /**< Runtime statistics */
     period_statistics_t period;          /**< Period statistics */
-    time_t period_start_time;            /**< Timestamp when current period started */
-    uint32_t period_duration_sec;        /**< Actual duration of completed period */
+    time_t period_start_time;            /**< Wall-clock timestamp when current period started */
+    uint32_t period_start_uptime_sec;    /**< system_uptime_sec at the start of the current period (used for period_elapsed math; mixing wall clock with uptime gives nonsense) */
+    uint32_t period_duration_sec;        /**< Actual duration of the most recently completed period (seconds) */
 } system_statistics_t;
 
 /**
+ * @brief NTRIP connection event types tracked by statistics_ntrip_event().
+ */
+typedef enum {
+    NTRIP_STATS_EVENT_CONNECTED = 0,    /**< Successful TCP+NTRIP handshake */
+    NTRIP_STATS_EVENT_DISCONNECTED,     /**< Connection closed (read/write error, peer FIN, etc.) */
+    NTRIP_STATS_EVENT_RECONNECT_BEGIN,  /**< Reconnect attempt started; pair with CONNECTED for timing */
+} ntrip_stats_event_t;
+
+/**
  * @brief Initialize the Statistics Task
- * 
+ *
  * Creates the statistics task and initializes all counters to zero.
  * Task starts collecting metrics immediately.
  */
 void statistics_task_init(void);
-
-/**
- * @brief Stop the Statistics Task
- * 
- * Stops the statistics task and cleans up resources.
- */
-void statistics_task_stop(void);
 
 /**
  * @brief Get current statistics (thread-safe)
@@ -199,19 +198,21 @@ void statistics_get_runtime(runtime_statistics_t* stats);
 void statistics_get_period(period_statistics_t* stats);
 
 /**
- * @brief Reset period statistics
- * 
- * Resets all period counters to zero, starts new interval.
- * Runtime statistics are preserved.
+ * @brief Update NTRIP event counter (called by NTRIP task)
+ *
+ * Tracks NTRIP connection lifecycle events. CONNECTED increments
+ * ntrip_reconnect_count when paired with a prior RECONNECT_BEGIN
+ * (the first CONNECTED of the device's lifetime is *not* counted as
+ * a reconnect). DISCONNECTED updates last_connection_state_change.
+ *
+ * @param event Event type — see ntrip_stats_event_t
  */
-void statistics_reset_period(void);
+void statistics_ntrip_event(ntrip_stats_event_t event);
 
 /**
- * @brief Update NTRIP event counter (called by NTRIP task)
- * 
- * @param event_type Event type (connect, disconnect, auth_fail, etc.)
+ * @brief Update WiFi reconnect counter (called by wifi manager)
  */
-void statistics_ntrip_event(uint8_t event_type);
+void statistics_wifi_reconnect(void);
 
 /**
  * @brief Update RTCM data received counter (called by NTRIP/GNSS tasks)
@@ -220,13 +221,6 @@ void statistics_ntrip_event(uint8_t event_type);
  * @param messages Number of messages received
  */
 void statistics_rtcm_received(uint32_t bytes, uint32_t messages);
-
-/**
- * @brief Update GPS fix quality event (called by GNSS task)
- * 
- * @param new_quality New fix quality value (0-8)
- */
-void statistics_fix_quality_changed(uint8_t new_quality);
 
 /**
  * @brief Update GGA transmission counter (called by NTRIP task)
@@ -276,22 +270,21 @@ void statistics_rtcm_latency(uint32_t latency_ms);
 
 /**
  * @brief Update RTCM data gap counter
+ *
+ * @param gap_sec Duration of the detected gap in seconds; accumulated into
+ *                period.rtcm_gap_duration_sec. Pass 0 if duration unknown.
  */
-void statistics_rtcm_data_gap(void);
+void statistics_rtcm_data_gap(uint32_t gap_sec);
 
 /**
- * @brief Update RTCM corrupted message counter
+ * @brief Increment the "config load failure" counter (called by configuration manager)
  */
-void statistics_rtcm_corrupted(void);
+void statistics_config_load_failure(void);
 
 /**
- * @brief Format statistics as JSON string
- * 
- * @param buffer Output buffer for JSON string
- * @param buffer_size Size of output buffer
- * @return Length of JSON string, or -1 on error
+ * @brief Increment the "task creation failure" counter (called from main on xTaskCreate failure)
  */
-int statistics_format_json(char* buffer, size_t buffer_size);
+void statistics_task_creation_failure(void);
 
 #ifdef __cplusplus
 }

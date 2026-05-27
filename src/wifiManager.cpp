@@ -9,6 +9,7 @@ void wifi_manager_get_ap_ssid(char* out_ssid, unsigned int len) {
 }
 #include "wifiManager.h"
 #include "configurationManagerTask.h"
+#include "statisticsTask.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -106,16 +107,24 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             case WIFI_EVENT_STA_DISCONNECTED: {
                 wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
                 int64_t now = esp_timer_get_time();
-                
+
+                // Count each disconnect-while-previously-connected as a reconnect
+                // event. The retry loop below handles the actual reconnection.
+                bool was_connected = sta_connected;
+
                 sta_connected = false;
                 sta_connecting = false;
                 strcpy(sta_ip_address, "0.0.0.0");
                 sta_rssi = 0;
-                
+
                 if (wifi_event_group) {
                     xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
                 }
-                
+
+                if (was_connected) {
+                    statistics_wifi_reconnect();
+                }
+
                 // Initialize retry logic on first disconnect
                 if (!retry_active) {
                     retry_active = true;
@@ -379,23 +388,6 @@ esp_err_t wifi_manager_connect_sta(const char* ssid, const char* password) {
     
     sta_connecting = true;
     return esp_wifi_connect();
-}
-
-esp_err_t wifi_manager_disconnect_sta(void) {
-    if (sta_connected || sta_connecting) {
-        ESP_LOGI(TAG, "Disconnecting from WiFi");
-        sta_connected = false;
-        sta_connecting = false;
-        
-        // Reset retry logic
-        retry_active = false;
-        first_disconnect_time = 0;
-        last_retry_time = 0;
-        
-        strcpy(sta_ip_address, "0.0.0.0");
-        return esp_wifi_disconnect();
-    }
-    return ESP_OK;
 }
 
 esp_err_t wifi_manager_get_status(wifi_status_t* status) {

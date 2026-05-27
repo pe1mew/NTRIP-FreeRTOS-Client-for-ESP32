@@ -1044,22 +1044,6 @@ esp_err_t http_server_start(void) {
     return ESP_OK;
 }
 
-esp_err_t http_server_stop(void) {
-    if (server == NULL) {
-        ESP_LOGW(TAG, "HTTP server not running");
-        return ESP_OK;
-    }
-    
-    ESP_LOGI(TAG, "Stopping HTTP server");
-    esp_err_t err = httpd_stop(server);
-    if (err == ESP_OK) {
-        server = NULL;
-        ESP_LOGI(TAG, "HTTP server stopped");
-    }
-    
-    return err;
-}
-
 bool http_server_is_running(void) {
     return (server != NULL);
 }

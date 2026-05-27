@@ -1,4 +1,5 @@
 #include "configurationManagerTask.h"
+#include "statisticsTask.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "nvs_flash.h"
@@ -89,6 +90,7 @@ static esp_err_t nvs_save_ui(const ui_config_t* config) {
     err = nvs_open("ui", NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open NVS for UI config: %s", esp_err_to_name(err));
+        statistics_config_load_failure();
         return err;
     }
 
@@ -151,6 +153,7 @@ static esp_err_t nvs_save_wifi(const app_wifi_config_t* config) {
     err = nvs_open(NVS_NAMESPACE_WIFI, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open NVS for WiFi config: %s", esp_err_to_name(err));
+        statistics_config_load_failure();
         return err;
     }
 
@@ -234,6 +237,7 @@ static esp_err_t nvs_save_ntrip(const ntrip_config_t* config) {
     err = nvs_open(NVS_NAMESPACE_NTRIP, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open NVS for NTRIP config: %s", esp_err_to_name(err));
+        statistics_config_load_failure();
         return err;
     }
 
@@ -312,6 +316,7 @@ static esp_err_t nvs_save_mqtt(const mqtt_config_t* config) {
     err = nvs_open(NVS_NAMESPACE_MQTT, NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open NVS for MQTT config: %s", esp_err_to_name(err));
+        statistics_config_load_failure();
         return err;
     }
 

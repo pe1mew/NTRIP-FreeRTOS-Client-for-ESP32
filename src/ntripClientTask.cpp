@@ -31,6 +31,28 @@ QueueHandle_t gga_queue = NULL;
 // Task handle
 static TaskHandle_t ntrip_task_handle = NULL;
 
+// Loop-time tracking (measured at start of each main-loop iteration; the
+// stats task queries the average periodically and resets).
+static int64_t ntrip_prev_loop_us = 0;
+static uint64_t ntrip_loop_time_sum_us = 0;
+static uint32_t ntrip_loop_count = 0;
+
+extern "C" {
+    // Exported for statisticsTask.cpp — returns the task handle (NULL if not started).
+    TaskHandle_t ntrip_task_get_handle(void) {
+        return ntrip_task_handle;
+    }
+    // Returns the running-average loop period in microseconds and resets the
+    // accumulator. Returns 0 if no samples since the last reset.
+    uint32_t ntrip_task_get_avg_loop_us_and_reset(void) {
+        uint32_t avg = (ntrip_loop_count > 0)
+            ? (uint32_t)(ntrip_loop_time_sum_us / ntrip_loop_count) : 0;
+        ntrip_loop_time_sum_us = 0;
+        ntrip_loop_count = 0;
+        return avg;
+    }
+}
+
 // Connection state
 static bool ntrip_connected = false;
 static time_t ntrip_connection_start = 0;
@@ -216,6 +238,14 @@ static void ntrip_client_task(void* pvParameters) {
     EventGroupHandle_t config_events = config_get_event_group();
 
     while (1) {
+        // Sample loop period (start-to-start) for the avg-loop-time stat.
+        int64_t now_loop_us = esp_timer_get_time();
+        if (ntrip_prev_loop_us != 0) {
+            ntrip_loop_time_sum_us += (uint64_t)(now_loop_us - ntrip_prev_loop_us);
+            ntrip_loop_count++;
+        }
+        ntrip_prev_loop_us = now_loop_us;
+
         // Poll for configuration changes and clear handled bits (matches MQTT behavior)
         EventBits_t bits = xEventGroupGetBits(config_events);
         if (bits & CONFIG_NTRIP_CHANGED_BIT) {
@@ -307,41 +337,52 @@ static void ntrip_client_task(void* pvParameters) {
             if (reconnect_needed || time_since_last_attempt >= ntrip_config.reconnect_delay_sec) {
                 last_connect_attempt = now;
                 reconnect_needed = false;
-                
-                ESP_LOGI(TAG, "Connecting to NTRIP caster: %s:%d/%s", 
+
+                ESP_LOGI(TAG, "Connecting to NTRIP caster: %s:%d/%s",
                          ntrip_config.host, ntrip_config.port, ntrip_config.mountpoint);
-                
+
+                // Stamp the reconnect start for ntrip_avg_reconnect_time_ms.
+                // The matching CONNECTED below also increments ntrip_reconnect_count.
+                statistics_ntrip_event(NTRIP_STATS_EVENT_RECONNECT_BEGIN);
+
                 // Initialize client
                 if (!client->init()) {
                     ESP_LOGE(TAG, "Failed to initialize NTRIP client");
                     vTaskDelay(pdMS_TO_TICKS(ntrip_config.reconnect_delay_sec * 1000));
                     continue;
                 }
-                
+
                 // Convert port to int for NTRIPClient API (expects int&)
                 int port = ntrip_config.port;
-                
+
                 // Connect to NTRIP caster
                 bool connect_success = false;
                 if (strlen(ntrip_config.user) > 0) {
-                    connect_success = client->reqRaw(ntrip_config.host, port, 
-                                                     ntrip_config.mountpoint, 
+                    connect_success = client->reqRaw(ntrip_config.host, port,
+                                                     ntrip_config.mountpoint,
                                                      ntrip_config.user, ntrip_config.password);
                 } else {
-                    connect_success = client->reqRaw(ntrip_config.host, port, 
+                    connect_success = client->reqRaw(ntrip_config.host, port,
                                                      ntrip_config.mountpoint);
                 }
-                
+
                 if (connect_success && client->isConnected()) {
                     ntrip_connected = true;
                     ntrip_connection_start = time(NULL);
                     last_gga_time = -1; // Set to -1 to trigger immediate GGA send on first message
+                    statistics_ntrip_event(NTRIP_STATS_EVENT_CONNECTED);
                     ESP_LOGI(TAG, "Successfully connected to NTRIP caster, waiting for first GGA");
                 } else {
-                    ESP_LOGW(TAG, "Failed to connect to NTRIP caster, will retry in %d seconds", 
+                    ESP_LOGW(TAG, "Failed to connect to NTRIP caster, will retry in %d seconds",
                              ntrip_config.reconnect_delay_sec);
                     client->disconnect();
                     ntrip_connected = false;
+                    // Best-effort auth-vs-other distinction: NTRIPClient logs the
+                    // status line ("NTRIP HTTP non-200: HTTP/1.1 401 Unauthorized").
+                    // We don't have an API to read the code back; treating every
+                    // failed connect as a generic disconnect is acceptable. If you
+                    // need auth-failure counts, add a getLastHttpStatus() to NTRIPClient.
+                    statistics_ntrip_event(NTRIP_STATS_EVENT_DISCONNECTED);
                 }
             }
         } else if (!ntrip_config.enabled && ntrip_connected) {
@@ -359,6 +400,7 @@ static void ntrip_client_task(void* pvParameters) {
                 client->disconnect();
                 ntrip_connected = false;
                 reconnect_needed = true;
+                statistics_ntrip_event(NTRIP_STATS_EVENT_DISCONNECTED);
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
@@ -368,8 +410,9 @@ static void ntrip_client_task(void* pvParameters) {
                 // Check for data gaps
                 uint64_t now = esp_timer_get_time();
                 if (last_rtcm_time != 0 && (now - last_rtcm_time) > (RTCM_GAP_THRESHOLD_MS * 1000ULL)) {
+                    uint32_t gap_sec = (uint32_t)((now - last_rtcm_time) / 1000000ULL);
                     ESP_LOGW(TAG, "RTCM data gap detected: %.1f sec", (now - last_rtcm_time) / 1000000.0);
-                    statistics_rtcm_data_gap();
+                    statistics_rtcm_data_gap(gap_sec);
                 }
                 
                 rtcm_data_t rtcm_msg;
@@ -384,6 +427,7 @@ static void ntrip_client_task(void* pvParameters) {
                     }
                     ntrip_connected = false;
                     reconnect_needed = true;
+                    statistics_ntrip_event(NTRIP_STATS_EVENT_DISCONNECTED);
                 } else if (bytes_read > 0) {
                     rtcm_msg.length = bytes_read;
                     rtcm_msg.receive_timestamp = esp_timer_get_time();
@@ -430,35 +474,41 @@ static void ntrip_client_task(void* pvParameters) {
                 if (last_gga_time == -1 || time_since_last_gga >= ntrip_config.gga_interval_sec) {
                     client->sendGGA(gga_msg.sentence);
                     last_gga_time = now;
-                    if (time_since_last_gga == INT64_MAX) {
-                        ESP_LOGI(TAG, "Sent first GGA to NTRIP server, starting %d sec interval: %s", 
-                                 ntrip_config.gga_interval_sec, gga_msg.sentence);
-                    } else {
-                        ESP_LOGI(TAG, "Sent GGA to NTRIP server: %s", gga_msg.sentence);
+                    // Only log task-level success if sendGGA didn't flip the
+                    // connected flag on a write failure. Otherwise the log
+                    // line lies: we'd say "Sent GGA to NTRIP server" while the
+                    // caster's TCP RST means nothing actually reached it.
+                    if (client->isConnected()) {
+                        if (time_since_last_gga == INT64_MAX) {
+                            ESP_LOGI(TAG, "Sent first GGA to NTRIP server, starting %d sec interval: %s",
+                                     ntrip_config.gga_interval_sec, gga_msg.sentence);
+                        } else {
+                            ESP_LOGI(TAG, "Sent GGA to NTRIP server: %s", gga_msg.sentence);
+                        }
                     }
+                    // If sendGGA failed and cleared connected_flag, the
+                    // "Connection lost" check at the end of this iteration
+                    // (`if (!client->isConnected())`) will set reconnect_needed
+                    // and the next loop iteration takes the reconnect path.
                 } else {
                     ESP_LOGD(TAG, "GGA received but interval not elapsed yet (%lld/%d sec)", 
                              time_since_last_gga, ntrip_config.gga_interval_sec);
                 }
-            } else {
-                // Send GGA periodically even if not received from GNSS (keep connection alive)
-                int64_t now = esp_timer_get_time();
-                int64_t time_since_last_gga = (now - last_gga_time) / 1000000;
-                
-                if (time_since_last_gga >= ntrip_config.gga_interval_sec) {
-                    // Send a dummy GGA to keep connection alive
-                    // In real implementation, GNSS task should be sending actual GGA
-                    last_gga_time = now;
-                    ESP_LOGD(TAG, "GGA interval elapsed (%d sec), waiting for GNSS data", 
-                             ntrip_config.gga_interval_sec);
-                }
             }
+            // Note: previously there was an "else" branch here that updated
+            // last_gga_time whenever the interval elapsed with an empty queue.
+            // That was a silent bug: it suppressed *every* subsequent GGA send,
+            // because the interval check on the next dequeued GGA computed
+            // time_since_last_gga against the reset (never-sent) timestamp and
+            // returned "interval not elapsed yet". Removed entirely — the only
+            // way last_gga_time advances is via an actual sendGGA() above.
             
             // Verify connection is still active
             if (!client->isConnected()) {
                 ESP_LOGW(TAG, "Connection lost, will attempt reconnect");
                 ntrip_connected = false;
                 reconnect_needed = true;
+                statistics_ntrip_event(NTRIP_STATS_EVENT_DISCONNECTED);
             }
         }
         
@@ -536,28 +586,3 @@ uint32_t ntrip_get_uptime_sec(void) {
     return ntrip_uptime_accumulated;
 }
 
-esp_err_t ntrip_client_task_stop(void) {
-    ESP_LOGI(TAG, "Stopping NTRIP Client Task");
-    
-    // Delete task
-    if (ntrip_task_handle != NULL) {
-        vTaskDelete(ntrip_task_handle);
-        ntrip_task_handle = NULL;
-    }
-    
-    // Delete queues
-    if (rtcm_queue != NULL) {
-        vQueueDelete(rtcm_queue);
-        rtcm_queue = NULL;
-    }
-    
-    if (gga_queue != NULL) {
-        vQueueDelete(gga_queue);
-        gga_queue = NULL;
-    }
-    
-    ntrip_connected = false;
-    
-    ESP_LOGI(TAG, "NTRIP Client Task stopped");
-    return ESP_OK;
-}

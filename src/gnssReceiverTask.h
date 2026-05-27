@@ -90,9 +90,4 @@ uint32_t gnss_get_update_count_and_reset(void);
  */
 bool gnss_has_valid_fix(void);
 
-/**
- * @brief Stop the GNSS Receiver Task.
- */
-void gnss_receiver_task_stop(void);
-
 #endif // GNSS_RECEIVER_TASK_H

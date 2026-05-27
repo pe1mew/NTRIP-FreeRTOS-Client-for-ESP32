@@ -71,54 +71,28 @@ esp_err_t mqtt_client_task_init(QueueHandle_t telemetry_json_queue) {
     return ESP_OK;
 }
 
-// Stop MQTT client task
-void mqtt_client_task_stop(void) {
-    if (mqtt_client) {
-        esp_mqtt_client_stop(mqtt_client);
-        esp_mqtt_client_destroy(mqtt_client);
-        mqtt_client = NULL;
-    }
-    
-    if (mqtt_task_handle) {
-        vTaskDelete(mqtt_task_handle);
-        mqtt_task_handle = NULL;
-    }
-    
-    ESP_LOGI(TAG, "MQTT client task stopped");
-}
-
 // Check connection status
 bool mqtt_is_connected(void) {
     return mqtt_connected;
 }
 
-// Get publish count
-uint32_t mqtt_get_publish_count(void) {
-    return total_published;
-}
-
-// Get MQTT uptime
-uint32_t mqtt_get_uptime_sec(void) {
+// Get MQTT uptime — internal helper used by build_periodic_stats_msg.
+static uint32_t mqtt_get_uptime_sec(void) {
     uint32_t uptime = mqtt_uptime_accumulated;
-    
+
     // Add current session time if connected
     if (mqtt_connected && mqtt_connection_start > 0) {
         struct timeval tv;
         gettimeofday(&tv, NULL);
         uptime += (tv.tv_sec - mqtt_connection_start);
     }
-    
+
     return uptime;
 }
 
-// Set last activity time
-void mqtt_set_last_activity_time(time_t timestamp) {
+// Set last activity time — internal helper used by the event handler / publishers.
+static void mqtt_set_last_activity_time(time_t timestamp) {
     last_activity_time = timestamp;
-}
-
-// Get last activity time
-time_t mqtt_get_last_activity_time(void) {
-    return last_activity_time;
 }
 
 // MQTT event handler
@@ -564,7 +538,6 @@ static void collect_period_statistics(mqtt_stats_message_t *msg) {
     msg->rtcm_message_rate = period_stats.rtcm_message_rate;
     msg->rtcm_data_gaps = period_stats.rtcm_data_gaps;
     msg->rtcm_avg_latency_ms = period_stats.rtcm_avg_latency_ms;
-    msg->rtcm_corrupted = period_stats.rtcm_corrupted_count;
     
     // GNSS metrics
     memcpy(msg->fix_quality_duration, period_stats.fix_quality_duration, sizeof(msg->fix_quality_duration));
@@ -681,8 +654,7 @@ static void format_stats_json(const mqtt_stats_message_t *msg, char *buffer, siz
         "      \"bytes_received\": %lu,\n"
         "      \"message_rate\": %lu,\n"
         "      \"data_gaps\": %lu,\n"
-        "      \"avg_latency_ms\": %lu,\n"
-        "      \"corrupted\": %lu\n"
+        "      \"avg_latency_ms\": %lu\n"
         "   },\n"
         "   \"gnss\": {\n"
         "      \"fix_duration\": {\n"
@@ -727,7 +699,6 @@ static void format_stats_json(const mqtt_stats_message_t *msg, char *buffer, siz
         msg->rtcm_message_rate,
         msg->rtcm_data_gaps,
         msg->rtcm_avg_latency_ms,
-        msg->rtcm_corrupted,
         msg->fix_quality_duration[0],  // no_fix
         msg->fix_quality_duration[1],  // gps
         msg->fix_quality_duration[2],  // dgps

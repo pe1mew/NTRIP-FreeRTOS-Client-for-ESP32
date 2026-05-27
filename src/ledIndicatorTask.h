@@ -57,13 +57,6 @@ void led_update_ntrip_activity(void);
 void led_update_mqtt_activity(void);
 
 /**
- * @brief Stop the LED Indicator Task and turn off all LEDs.
- *
- * Deletes the LED indicator task and turns off all discrete and RGB LEDs.
- */
-void led_indicator_task_stop(void);
-
-/**
  * @brief Initialize the RGB LED hardware (RMT driver).
  *
  * Should be called before using set_led_color or led_set_rgb if not using led_indicator_task_init.

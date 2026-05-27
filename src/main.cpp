@@ -73,6 +73,7 @@ extern "C" void app_main(void) {
     ret = ntrip_client_task_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize NTRIP Client Task: %s", esp_err_to_name(ret));
+        statistics_task_creation_failure();
         return;
     }
     ESP_LOGI(TAG, "✓ NTRIP Client Task initialized");
@@ -89,6 +90,7 @@ extern "C" void app_main(void) {
     ret = data_output_task_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize Data Output Task: %s", esp_err_to_name(ret));
+        statistics_task_creation_failure();
         return;
     }
     ESP_LOGI(TAG, "✓ Data Output Task initialized");

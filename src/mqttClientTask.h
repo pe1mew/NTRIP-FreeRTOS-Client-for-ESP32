@@ -58,7 +58,6 @@ typedef struct {
     uint32_t rtcm_message_rate;  // messages/sec
     uint32_t rtcm_data_gaps;
     uint32_t rtcm_avg_latency_ms; // Average RTCM latency
-    uint32_t rtcm_corrupted;     // Corrupted RTCM messages
     
     // GNSS statistics (period)
     uint32_t fix_quality_duration[9]; // Seconds in each fix state
@@ -104,48 +103,11 @@ typedef struct {
 esp_err_t mqtt_client_task_init(QueueHandle_t telemetry_json_queue);
 
 /**
- * @brief Stop the MQTT client task
- * 
- * Gracefully disconnects from broker and deletes the task.
- */
-void mqtt_client_task_stop(void);
-
-/**
  * @brief Check if MQTT client is connected to broker
- * 
+ *
  * @return true if connected, false otherwise
  */
 bool mqtt_is_connected(void);
-
-/**
- * @brief Get total number of messages published since boot
- * 
- * @return Total message count
- */
-uint32_t mqtt_get_publish_count(void);
-
-/**
- * @brief Get cumulative MQTT connection uptime in seconds
- * 
- * @return Total seconds connected to broker since boot
- */
-uint32_t mqtt_get_uptime_sec(void);
-
-/**
- * @brief Update last activity timestamp for MQTT LED indicator
- * 
- * Called internally after each publish. Used by LED Indicator Task.
- * 
- * @param timestamp Time of last MQTT activity
- */
-void mqtt_set_last_activity_time(time_t timestamp);
-
-/**
- * @brief Get last MQTT activity timestamp
- * 
- * @return Timestamp of last publish/receive event
- */
-time_t mqtt_get_last_activity_time(void);
 
 #ifdef __cplusplus
 }

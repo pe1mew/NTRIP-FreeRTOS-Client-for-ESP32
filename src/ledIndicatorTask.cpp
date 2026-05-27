@@ -16,6 +16,7 @@
 #include <driver/gpio.h>
 #include <driver/rmt_tx.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <string.h>
 #include <sys/time.h>
 #include <freertos/queue.h>
@@ -112,6 +113,24 @@ static time_t last_mqtt_activity = 0;
 static rmt_channel_handle_t led_channel = NULL;
 static rmt_encoder_handle_t led_encoder = NULL;
 static QueueHandle_t rgb_led_cmd_queue = NULL;
+
+// Loop-time tracking (queried by stats task).
+static int64_t led_prev_loop_us = 0;
+static uint64_t led_loop_time_sum_us = 0;
+static uint32_t led_loop_count = 0;
+
+extern "C" {
+    TaskHandle_t led_task_get_handle(void) {
+        return led_task_handle;
+    }
+    uint32_t led_task_get_avg_loop_us_and_reset(void) {
+        uint32_t avg = (led_loop_count > 0)
+            ? (uint32_t)(led_loop_time_sum_us / led_loop_count) : 0;
+        led_loop_time_sum_us = 0;
+        led_loop_count = 0;
+        return avg;
+    }
+}
 
 /**
  * @brief Update NTRIP activity timestamp.
@@ -300,6 +319,16 @@ static void led_indicator_task(void *pvParameters) {
     set_led_color(0, 0, 0);
     
     while (1) {
+        // Sample loop period for the per-task avg-loop-time stat.
+        {
+            int64_t now_loop_us = esp_timer_get_time();
+            if (led_prev_loop_us != 0) {
+                led_loop_time_sum_us += (uint64_t)(now_loop_us - led_prev_loop_us);
+                led_loop_count++;
+            }
+            led_prev_loop_us = now_loop_us;
+        }
+
         // Check for RGB LED command
         rgb_led_cmd_t cmd;
         if (rgb_led_cmd_queue && xQueueReceive(rgb_led_cmd_queue, &cmd, 0)) {
@@ -396,21 +425,3 @@ void led_set_rgb(uint8_t r, uint8_t g, uint8_t b, TickType_t duration_ticks) {
     }
 }
 
-/**
- * @brief Stop the LED Indicator Task and turn off all LEDs.
- */
-void led_indicator_task_stop(void) {
-    if (led_task_handle != NULL) {
-        vTaskDelete(led_task_handle);
-        led_task_handle = NULL;
-        ESP_LOGI(TAG, "LED Indicator Task stopped");
-    }
-    
-    // Turn off all LEDs
-    gpio_set_level(WIFI_LED, 0);
-    gpio_set_level(NTRIP_LED, 0);
-    gpio_set_level(MQTT_LED, 0);
-    gpio_set_level(FIX_RTK_LED, 0);
-    gpio_set_level(FIX_RTKFLOAT_LED, 0);
-    gpio_set_level(STATUS_LED_PIN, 0);
-}

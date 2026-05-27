@@ -88,15 +88,6 @@ static inline bool ntrip_is_connected(void) {
  */
 uint32_t ntrip_get_uptime_sec(void);
 
-/**
- * @brief Stop NTRIP client task and cleanup resources
- * 
- * Disconnects from NTRIP caster, deletes queues, and stops the task.
- * 
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t ntrip_client_task_stop(void);
-
 #ifdef __cplusplus
 }
 #endif

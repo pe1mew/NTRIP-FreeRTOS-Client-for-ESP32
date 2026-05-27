@@ -121,22 +121,6 @@ typedef struct {
 esp_err_t data_output_task_init(void);
 
 /**
- * @brief Stop the Data Output Task and cleanup resources
- * 
- * Stops the task, closes UART, and releases resources.
- * 
- * @return ESP_OK on success
- */
-/**
- * @brief Stop the Data Output Task and cleanup resources.
- *
- * Stops the task, closes UART, and releases resources.
- *
- * @return ESP_OK on success
- */
-esp_err_t data_output_task_stop(void);
-
-/**
  * @brief Get the telemetry JSON forwarding queue handle.
  *
  * The queue carries telemetry_json_msg_t items decoded from UART1 RX frames.

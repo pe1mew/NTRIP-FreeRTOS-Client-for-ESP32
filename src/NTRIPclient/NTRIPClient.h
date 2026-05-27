@@ -23,22 +23,27 @@
 #ifndef NTRIP_CLIENT
 #define NTRIP_CLIENT
 
-#include "esp_http_client.h"
 #include "esp_log.h"
 #include "mbedtls/base64.h"
 #include <cstring>
 #include <cstdio>
+#include <cstddef>
 
 /**
  * @class NTRIPClient
  * @brief A client for NTRIP (Networked Transport of RTCM via Internet Protocol).
- * 
- * This class provides functionality for requesting MountPoints List and RAW data
- * from an NTRIP Caster using ESP-IDF HTTP client.
+ *
+ * Uses a raw lwIP TCP socket (not esp_http_client) because NTRIP needs
+ * bidirectional traffic on a single socket: the client streams GGA upstream
+ * while the caster streams RTCM downstream. esp_http_client's request/response
+ * state machine RSTs the socket when it sees unsolicited writes after a GET
+ * response begins, breaking NTRIP 2.0; without the Ntrip/2.0 header the
+ * caster falls back to NTRIP 1.0 "ICY 200 OK", which esp_http_client_fetch_headers
+ * can't parse. Raw sockets handle both response shapes and full duplex.
  */
 class NTRIPClient {
 private:
-    esp_http_client_handle_t client;
+    int sock_fd;        // raw TCP socket; -1 when not connected
     char* buffer;
     size_t buffer_size;
     size_t buffer_pos;

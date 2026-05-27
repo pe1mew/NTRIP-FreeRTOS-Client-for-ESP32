@@ -25,6 +25,7 @@
 #include <driver/uart.h>
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
@@ -34,6 +35,31 @@ static const char *TAG = "DataOutputTask";
 
 // Task handle
 static TaskHandle_t data_output_task_handle = NULL;
+
+// Loop-time + transmit-count tracking (queried by stats task).
+static int64_t dataout_prev_loop_us = 0;
+static uint64_t dataout_loop_time_sum_us = 0;
+static uint32_t dataout_loop_count = 0;
+static uint32_t dataout_tx_count = 0;
+
+extern "C" {
+    TaskHandle_t data_output_task_get_handle(void) {
+        return data_output_task_handle;
+    }
+    uint32_t data_output_task_get_avg_loop_us_and_reset(void) {
+        uint32_t avg = (dataout_loop_count > 0)
+            ? (uint32_t)(dataout_loop_time_sum_us / dataout_loop_count) : 0;
+        dataout_loop_time_sum_us = 0;
+        dataout_loop_count = 0;
+        return avg;
+    }
+    // Returns number of successful UART transmissions since last call and resets.
+    uint32_t data_output_get_tx_count_and_reset(void) {
+        uint32_t n = dataout_tx_count;
+        dataout_tx_count = 0;
+        return n;
+    }
+}
 
 // Queue for forwarding received telemetry JSON to the MQTT task
 static QueueHandle_t s_json_queue = NULL;
@@ -276,6 +302,16 @@ static void data_output_task(void* pvParameters) {
     ESP_LOGI(TAG, "Waiting for GNSS data updates...");
 
     while (1) {
+        // Sample loop period for the per-task avg-loop-time stat.
+        {
+            int64_t now_loop_us = esp_timer_get_time();
+            if (dataout_prev_loop_us != 0) {
+                dataout_loop_time_sum_us += (uint64_t)(now_loop_us - dataout_prev_loop_us);
+                dataout_loop_count++;
+            }
+            dataout_prev_loop_us = now_loop_us;
+        }
+
         // Check if output is enabled (future: read from configuration)
         if (!config.enabled) {
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -351,6 +387,7 @@ static void data_output_task(void* pvParameters) {
                 statistics_uart_error();
             } else {
                 ESP_LOGD(TAG, "Transmitted %d bytes (valid=%d)", written, position.valid);
+                dataout_tx_count++;  // for telemetry_output_rate_hz
             }
         } else {
             ESP_LOGW(TAG, "Failed to build telemetry frame");
@@ -396,17 +433,3 @@ esp_err_t data_output_task_init(void) {
     return ESP_OK;
 }
 
-esp_err_t data_output_task_stop(void) {
-    ESP_LOGI(TAG, "Stopping Data Output Task");
-
-    if (data_output_task_handle != NULL) {
-        vTaskDelete(data_output_task_handle);
-        data_output_task_handle = NULL;
-    }
-
-    // Cleanup UART
-    uart_driver_delete(OUTPUT_UART_NUM);
-
-    ESP_LOGI(TAG, "Data Output Task stopped");
-    return ESP_OK;
-}

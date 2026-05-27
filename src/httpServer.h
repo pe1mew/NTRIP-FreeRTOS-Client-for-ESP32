@@ -18,15 +18,6 @@
 esp_err_t http_server_start(void);
 
 /**
- * @brief Stop the HTTP server
- * 
- * Shuts down the HTTP server and releases resources.
- * 
- * @return ESP_OK on success, error code otherwise
- */
-esp_err_t http_server_stop(void);
-
-/**
  * @brief Check if HTTP server is running
  * 
  * @return true if server is running, false otherwise
