@@ -1,5 +1,14 @@
 ### Example JSON payload
 
+Compact form (whitespace-free, as emitted on the wire — exactly one frame,
+~770–780 bytes typical):
+
+```json
+{"seq":4,"tim":"17:30:20.000","vhl":{"acc":{"x":{"min":-120.50,"max":135.25,"avg":2.10},"y":{"min":-95.00,"max":110.75,"avg":-1.40},"z":{"min":920.00,"max":1080.50,"avg":1000.20}},"thr":{"val":{"min":0.0,"max":100.0,"avg":45.3},"ctrlMode":1,"mtrMode":3,"swEn":1,"dbgMode":0},"spd":{"min":0.00,"max":8.50,"avg":4.25},"lat":52.3676000,"lon":4.9041000},"mtr":{"mtl":{"ctrl":{"min":-12.30,"max":85.40,"avg":50.10},"ctrlMode":1,"mtrMode":3,"swEn":1,"state":2,"trq":{"min":-100.0,"max":100.0,"avg":15.5},"rpm":{"min":-2500.0,"max":8200.0,"avg":4500.0},"tmp":{"min":42.5,"max":47.3,"avg":45.1}},"mpw":{"pwr":{"min":-250.0,"max":750.5,"avg":400.2},"cur":{"min":0.00,"max":180.50,"avg":95.30}}},"spc":{"fan":35,"h2P1":0.52,"h2P2":0.48,"tankP":250.30,"vsc":78.5,"fsa":25.40}}
+```
+
+Pretty-printed for readability (whitespace **not** transmitted):
+
 ```json
 {
   "seq": 4,
@@ -15,8 +24,8 @@
       "ctrlMode": 1, "mtrMode": 3, "swEn": 1, "dbgMode": 0
     },
     "spd": {"min":0.00,"max":8.50,"avg":4.25},
-    "lat": 52.3676,
-    "lon": 4.9041
+    "lat": 52.3676000,
+    "lon": 4.9041000
   },
   "mtr": {
     "mtl": {
@@ -75,6 +84,32 @@ churn.
 
 ---
 
+### Numeric formatting (current implementation)
+
+All floats are emitted by `snprintf` with fixed decimal precision. Receivers
+parsing the JSON should accept the precision below — values are zero-padded
+on the fractional side but **not** on the integer side.
+
+| Field(s) | Format | Decimal places | Example |
+|----------|--------|:--:|---------|
+| `vhl.acc.{x,y,z}.{min,max,avg}` | `%.2f` | 2 | `1000.20` |
+| `vhl.thr.val.{min,max,avg}` | `%.1f` | 1 | `45.3` |
+| `vhl.thr.{ctrlMode,mtrMode,swEn,dbgMode}` | `%d` | (integer) | `1` |
+| `vhl.spd.{min,max,avg}` | `%.2f` | 2 | `4.25` |
+| `vhl.lat`, `vhl.lon` | `%.7f` | 7 | `52.3676000` |
+| `mtr.mtl.ctrl.{min,max,avg}` | `%.2f` | 2 | `-12.30` |
+| `mtr.mtl.{ctrlMode,mtrMode,swEn,state}` | `%d` | (integer) | `2` |
+| `mtr.mtl.{trq,rpm,tmp}.{min,max,avg}` | `%.1f` | 1 | `4500.0` |
+| `mtr.mpw.pwr.{min,max,avg}` | `%.1f` | 1 | `400.2` |
+| `mtr.mpw.cur.{min,max,avg}` | `%.2f` | 2 | `95.30` |
+| `spc.fan` | `%d` | (integer) | `35` |
+| `spc.h2P1`, `spc.h2P2`, `spc.tankP`, `spc.fsa` | `%.2f` | 2 | `250.30` |
+| `spc.vsc` | `%.1f` | 1 | `78.5` |
+| `seq` | `%u` | (unsigned int) | `4` |
+| `tim` | string `HH:MM:SS.mmm` | — | `17:30:20.000` |
+
+---
+
 ### Envelope
 
 | Key | Type | Description |
@@ -86,31 +121,37 @@ churn.
 
 ### `vhl` block — Vehicle
 
+> Columns: **Emulator range** is what the current implementation actually
+> emits on the wire. **Sensor / spec range** is the underlying signal's
+> design range (per `documentation/sensorData.md` and
+> `documentation/framedCRCString.md`). Where the two differ, the emulator
+> deliberately uses a narrower band to keep test waveforms representative.
+
 #### `vhl.acc` — Accelerometer (CSV tag `ACC`)
 
-| Key | Structure | Signal | Unit | Range | Source |
-|-----|-----------|--------|------|-------|--------|
-| `x` | `{min, max, avg}` | Acceleration X | raw counts | ±4096 (13-bit ADXL345) | ADXL345 SPI |
-| `y` | `{min, max, avg}` | Acceleration Y | raw counts | ±4096 (13-bit ADXL345) | ADXL345 SPI |
-| `z` | `{min, max, avg}` | Acceleration Z | raw counts | ±4096 (13-bit ADXL345) | ADXL345 SPI |
+| Key | Structure | Signal | Unit | Emulator range | Sensor / spec range | Source |
+|-----|-----------|--------|------|---------------|--------------------|--------|
+| `x` | `{min, max, avg}` | Acceleration X | raw counts | -4096 … +4096 | ±4096 (13-bit ADXL345) | ADXL345 SPI |
+| `y` | `{min, max, avg}` | Acceleration Y | raw counts | -4096 … +4096 | ±4096 (13-bit ADXL345) | ADXL345 SPI |
+| `z` | `{min, max, avg}` | Acceleration Z | raw counts | -512 … +4096 (gravity-biased) | ±4096 (13-bit ADXL345) | ADXL345 SPI |
 
 #### `vhl.thr` — Motor Control Command / Throttle (CSV tag `THR`)
 
-| Key | Structure | Signal | Unit | Range | Source |
-|-----|-----------|--------|------|-------|--------|
-| `val` | `{min, max, avg}` | Throttle paddle / control_value | % | 0–100 | CAN ID `0x045` |
-| `ctrlMode` | scalar `int` | Control mode | enum | 0–1 (1 bit) | last received |
-| `mtrMode` | scalar `int` | Motor mode | enum | 0–7 (3 bits) | last received |
-| `swEn` | scalar `int` | Software enable | flag | 0 or 1 | last received |
-| `dbgMode` | scalar `int` | Debug mode | flag | 0 or 1 | last received |
+| Key | Structure | Signal | Unit | Emulator range | Sensor / spec range | Source |
+|-----|-----------|--------|------|---------------|--------------------|--------|
+| `val` | `{min, max, avg}` | Throttle paddle / control_value | % | 0.0 … 100.0 | 0–100 (`uint8_t`) | CAN ID `0x045` |
+| `ctrlMode` | scalar `int` | Control mode | enum | cycle 0…1 | 1 bit | last received |
+| `mtrMode` | scalar `int` | Motor mode | enum | cycle 0…7 | 3 bits | last received |
+| `swEn` | scalar `int` | Software enable | flag | cycle 0…1 | 1 bit | last received |
+| `dbgMode` | scalar `int` | Debug mode | flag | cycle 0…1 | 1 bit | last received |
 
 #### `vhl.spd`, `vhl.lat`, `vhl.lon` — Vehicle dynamics
 
-| Key | Structure | Signal | Unit | Range | Resolution | Source |
-|-----|-----------|--------|------|-------|------------|--------|
-| `spd` | `{min, max, avg}` | Vehicle speed | m/s | 0.0–10.0 | — | — |
-| `lat` | scalar `float` | Latitude | decimal degrees | signed | 7 dp (≤ 1.1 cm at equator) | NTRIP receiver |
-| `lon` | scalar `float` | Longitude | decimal degrees | signed | 7 dp (≤ 1.1 cm at equator) | NTRIP receiver |
+| Key | Structure | Signal | Unit | Emulator range | Notes | Source |
+|-----|-----------|--------|------|---------------|-------|--------|
+| `spd` | `{min, max, avg}` | Vehicle speed | m/s | 0.00 … 10.00 | non-spec extra (not in `framedCRCString.md`) | synthetic |
+| `lat` | scalar `float` | Latitude | decimal degrees | signed, ≤ 1.1 cm precision at equator | non-spec extra | NTRIP receiver |
+| `lon` | scalar `float` | Longitude | decimal degrees | signed, ≤ 1.1 cm precision at equator | non-spec extra | NTRIP receiver |
 
 ---
 
@@ -118,23 +159,23 @@ churn.
 
 #### `mtr.mtl` — Motor Telemetry (CSV tag `MTL`, CAN ID `0x064`)
 
-| Key | Structure | Signal | Unit | Range | Resolution |
-|-----|-----------|--------|------|-------|------------|
-| `ctrl` | `{min, max, avg}` | Control value | — | `int16_t` | 1 |
-| `ctrlMode` | scalar `int` | Control mode | enum | 0–1 (1 bit) | last received |
-| `mtrMode` | scalar `int` | Motor mode | enum | 0–7 (3 bits) | last received |
-| `swEn` | scalar `int` | Software enable | flag | 0 or 1 | last received |
-| `state` | scalar `int` | Motor state | enum | 0–3 (2 bits) | last received |
-| `trq` | `{min, max, avg}` | Motor torque | Nm | -100 to +100 | `int16_t` (1 Nm) |
-| `rpm` | `{min, max, avg}` | Motor speed | RPM | -10000 to +10000 | 0.1 RPM per LSB |
-| `tmp` | `{min, max, avg}` | Motor temperature | °C | -128 to +127 | 1 °C (`int8_t`) |
+| Key | Structure | Signal | Unit | Emulator range | Sensor / spec range |
+|-----|-----------|--------|------|---------------|--------------------|
+| `ctrl` | `{min, max, avg}` | Control value | — | -100.00 … +100.00 | `int16_t` |
+| `ctrlMode` | scalar `int` | Control mode | enum | cycle 0…1 | 1 bit |
+| `mtrMode` | scalar `int` | Motor mode | enum | cycle 0…7 | 3 bits |
+| `swEn` | scalar `int` | Software enable | flag | cycle 0…1 | 1 bit |
+| `state` | scalar `int` | Motor state | enum | cycle 0…3 | 2 bits |
+| `trq` | `{min, max, avg}` | Motor torque | Nm | -100.0 … +100.0 | -100 … +100 (`int16_t`) |
+| `rpm` | `{min, max, avg}` | Motor speed | RPM | -10000.0 … +10000.0 | -10000 … +10000 (0.1 RPM/LSB) |
+| `tmp` | `{min, max, avg}` | Motor temperature | °C | 25.0 … 85.0 (warm-up profile) | -128 … +127 (`int8_t`) |
 
 #### `mtr.mpw` — Motor Power (CSV tag `MPW`, CAN ID `0x065`)
 
-| Key | Structure | Signal | Unit | Range | Resolution |
-|-----|-----------|--------|------|-------|------------|
-| `pwr` | `{min, max, avg}` | Motor power | W | -1000 to +1000 | `int16_t` (1 W) |
-| `cur` | `{min, max, avg}` | Inverter peak current | A | 0–200 | `int16_t` |
+| Key | Structure | Signal | Unit | Emulator range | Sensor / spec range |
+|-----|-----------|--------|------|---------------|--------------------|
+| `pwr` | `{min, max, avg}` | Motor power | W | -1000.0 … +1000.0 | -1000 … +1000 (`int16_t`, 1 W) |
+| `cur` | `{min, max, avg}` | Inverter peak current | A | 0.00 … 200.00 (positive only) | `int16_t` |
 
 ---
 
@@ -145,20 +186,34 @@ All `spc` fields are last-received scalars per the CSV-protocol convention
 asynchronously at its own rate, so no aggregation is applied — every value
 is the most recent sample at the publish tick.
 
-| Key | Type | Signal | Spectronik key | Unit | Range | Resolution |
-|-----|------|--------|----------------|------|-------|------------|
-| `fan` | scalar `int` | Fan speed | `FAN` | % | 0–100 | 1% |
-| `h2P1` | scalar `float` | H2 Pressure Sensor 1 | `H2PressureSensor1` | bar | 0.30–0.70 (emulator) | 2 decimals |
-| `h2P2` | scalar `float` | H2 Pressure Sensor 2 | `H2PressureSensor2` | bar | 0.30–0.70 (emulator) | 2 decimals |
-| `tankP` | scalar `float` | H2 Tank Pressure | `H2TankPressure` | bar | 0.00–500.00 | 2 decimals |
-| `vsc` | scalar `float` | Supercapacitor voltage | `UCB_V` | V | 0.0–100.0 | 1 decimal |
-| `fsa` | scalar `float` | Fuel Cell Current | `FuelCellCurrent` (`FC_A`) | A | 0.0–50.0 | 2 decimals |
+| Key | Type | Signal | Spectronik key | Unit | Emulator range | Sensor / spec range |
+|-----|------|--------|----------------|------|---------------|--------------------|
+| `fan` | scalar `int` | Fan speed | `FAN` | % | 0 … 100 | 0–100 (`uint8_t`) |
+| `h2P1` | scalar `float` | H2 Pressure Sensor 1 | `H2PressureSensor1` | bar | 0.30 … 0.70 | 0.00–1.00 (typical ~0.5) |
+| `h2P2` | scalar `float` | H2 Pressure Sensor 2 | `H2PressureSensor2` | bar | 0.30 … 0.70 | 0.00–1.00 (typical ~0.5) |
+| `tankP` | scalar `float` | H2 Tank Pressure | `H2TankPressure` | bar | 0.00 … 500.00 | 0.00–500.00 |
+| `vsc` | scalar `float` | Supercapacitor voltage | `UCB_V` | V | 0.0 … 100.0 | 0.0–100.0 |
+| `fsa` | scalar `float` | Fuel Cell Current | `FuelCellCurrent` (`FC_A`) | A | 0.0 … 50.0 | unbounded `float` (non-spec extra; PARSE_FUELCELLCURRENT is disabled in active SPC config) |
 
 ---
 
 ## Wire Format Specification
 
-The JSON payload is serialised to a compact (whitespace-free) UTF-8 string, then wrapped in the binary frame described below before transmission over UART1 (115200 baud, 8N1, TX on GPIO4).
+The JSON payload is serialised to a compact (whitespace-free) UTF-8 string, then wrapped in the binary frame described below before transmission over UART1 (115200 baud, 8N1, TX on GPIO4). Publish cadence is set by `CONFIG_EMUL_PERIOD_MS` (default 1000 ms, range 100–60000 ms; configured via `idf.py menuconfig` → TelemetryEmulator).
+
+### Sizing — current implementation
+
+| Quantity | Value |
+|----------|-------|
+| Observed payload length (full hybrid layout) | ~770 – 780 bytes (worst case ~835) |
+| Emulator JSON buffer (`EMUL_JSON_BUF_SIZE`) | 1024 bytes (static BSS) |
+| Emulator wire buffer (`EMUL_WIRE_BUF_SIZE`) | 2 × `EMUL_JSON_BUF_SIZE` + 6 = 2054 bytes (static BSS) |
+| Receiver frame buffer (`RECV_FRAME_BUF_SIZE`) | 1024 bytes (static BSS) |
+| UART line utilisation @ 1 Hz | ~7% of 115200 baud |
+| UART line utilisation @ 10 Hz | ~70% of 115200 baud |
+
+The large buffers were moved out of task stacks into BSS so growth in payload
+size does not risk a stack overflow — both tasks are singletons.
 
 ### Frame structure
 
